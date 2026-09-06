@@ -16,6 +16,8 @@ agent-test/
 ├── uv.lock                     # uv 生成的锁定文件（由 uv sync 生成）
 ├── .env.example                # 环境变量示例（复制为 .env 后填写）
 ├── conftest.py                 # pytest 根配置（测试间隔离运行时日志）
+├── scripts/                    # 运维脚本
+│   └── start-llama-qwen.ps1    # 本地 Qwen 小模型一键启动（llama.cpp + OpenAI 兼容）
 ├── src/agent_test/             # 主包：按功能模块组织
 │   ├── exceptions/             # 异常体系（AgentBaseError 基类 + 分类异常）
 │   │   ├── base.py             #   AgentBaseError（业务异常统一基类）
@@ -63,6 +65,32 @@ agent-test/
 ├── sessions/                   # 运行时生成：{session_id}.jsonl（会话事件，gitignore）
 └── logs/                       # 运行时生成：runtime.log（完整日志，gitignore）
 ```
+
+
+## 本地小模型一键启动与测试（Qwen2.5-0.5B-Instruct）
+
+仓库用本地 `Qwen2.5-0.5B-Instruct`（GGUF q4_k_m，约 469MB，HF 缓存位于
+`HF_HOME=E:\hf_home`）做低成本端到端测试：通过 `.env` 把模型作为输入
+（`BASE_URI` / `MODEL_NAME` 指向本地 llama.cpp）。
+
+```powershell
+# 1) 一键启动 llama.cpp 服务（OpenAI 兼容，127.0.0.1:8080；幂等，已在运行则复用）
+powershell -ExecutionPolicy Bypass -File scripts\start-llama-qwen.ps1
+#    停止：追加 -Stop；换端口：-Port 8081；强制重启：-ForceRestart
+
+# 2) .env 指向本地模型（本项目当前已切换；还原云端见 .env 顶部注释）
+#    BASE_URI=http://127.0.0.1:8080/v1
+#    MODEL_NAME=qwen2.5-0.5b-instruct
+
+# 3) 端到端测试：qwen 会自动发起 read 工具调用并基于结果作答
+uv run python main.py "请使用 read 工具读取 E:\workspace\agent-test\README.md 的前 15 行，并告诉我第一行标题"
+
+# 4) 或让脚本就绪后自动跑一次 demo
+powershell -ExecutionPolicy Bypass -File scripts\start-llama-qwen.ps1 -RunDemo "请用一句话介绍你自己"
+```
+
+脚本会自动定位 `HF_HOME` 下的 llama.cpp 运行时与 Qwen GGUF 缓存（快照符号链接
+自动解析到 blobs 真实文件），日志写入 `logs/llama-server-<port>.log(.err.log)`。
 
 ## 快速开始（uv）
 
