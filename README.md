@@ -313,3 +313,34 @@ MODEL_NAME=qwen2.5-0.5b-instruct
 - 停止服务：`Stop-Process -Id <llama-server 的 PID>`；
 - 适用范围：0.5B 模型已成功完成 `read` 工具调用 + 总结的完整 ReAct 循环；
   复杂工具/推理建议换更大的模型（同样走 OpenAI 兼容接口，仅需改 `MODEL_NAME`）。
+## 本地 GPU 小模型（3060 6GB）：Qwen2.5-7B / 3B 一键启动
+
+在 0.5B 冒烟之上，3060 6GB 已部署两档可用模型（llama.cpp CUDA 构建 + GGUF
+缓存在 `E:\hf_home\gguf\`），均通过真实 agent-loop（read 工具）验证：
+
+| 脚本 | 模型 / 量化 | 权重 | 默认端口 | 默认 ctx | 实测生成速度（3060 Laptop 6GB） |
+|---|---|---|---|---|---|
+| `scripts\start-qwen25-7b.ps1` | Qwen2.5-7B-Instruct Q4_K_M | 4.36 GB | 8080 | 8192 | ~12 tok/s（显存 ~5.5/6 GB） |
+| `scripts\start-qwen25-3b.ps1` | Qwen2.5-3B-Instruct Q8_0 | 3.37 GB | 8081 | 16384 | ~55 tok/s（显存 ~4.6/6 GB） |
+
+- 运行时：`E:\hf_home\runtime\llama.cpp-cuda\llama-server.exe`（b10679 CUDA
+  12.4；需把 `cudart-llama-bin` 包里的 `cudart64_12.dll / cublas64_12.dll /
+  cublasLt64_12.dll` 放入同目录才能加载 `ggml-cuda.dll`）；
+- 启动参数默认全量 GPU offload（`-ngl 99`），KV Cache 用 `q8_0` 在 6GB 显存
+  上换取更长上下文；`-RunDemo` 会临时把 `BASE_URI`/`MODEL_NAME` 指向该模型，
+  无需手工改 `.env`：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\start-qwen25-7b.ps1
+powershell -ExecutionPolicy Bypass -File scripts\start-qwen25-7b.ps1 -RunDemo "请调用 read 工具读取 README.md 前 10 行"
+powershell -ExecutionPolicy Bypass -File scripts\start-qwen25-7b.ps1 -Stop
+# 3B 同理：scripts\start-qwen25-3b.ps1（默认端口 8081，ctx 16384）
+```
+
+- 想用哪个模型跑 agent-test，把 `.env` 的 `BASE_URI`/`MODEL_NAME` 指到对应
+  端口/别名即可（7B: `http://127.0.0.1:8080/v1` + `qwen2.5-7b-instruct`；
+  3B: `http://127.0.0.1:8081/v1` + `qwen2.5-3b-instruct`）；
+- 模型文件下载自 ModelScope：7B 官方 `Qwen/Qwen2.5-7B-Instruct-GGUF` 的
+  `q4_k_m` 分片已用 `llama-gguf-split --merge` 合并为单文件；3B 用
+  `Qwen/Qwen2.5-3B-Instruct-GGUF` 的 `q8_0` 单文件。7B 若偶发 CUDA OOM，
+  调小 `-GpuLayers`（如 60）让 CPU 兜底。
