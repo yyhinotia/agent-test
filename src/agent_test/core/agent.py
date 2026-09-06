@@ -147,15 +147,22 @@ class ReactAgent:
                 for block in assistant_message.content
                 if isinstance(block, ToolCallBlock)
             ]
-            # pre_step：整步工具调用先做一次“全量预检”（审批/危险/
-            # 工作目录检测），决策先于任何副作用；未放行的调用不再执行。
+            # pre_step：整步工具调用先做一次“全量预检”。硬拒绝（DENY）
+            # 在副作用前拦截；REQUIRE_APPROVAL 在未配置 approver 时也
+            # 在此拦截，配置了 approver 则交由 ToolCenter 闸门交互审批
+            # （批准 -> 记住前缀 -> 执行；拒绝 -> 原因回传 LLM）。
             decisions = self._pre_step(tool_calls)
             for tc in tool_calls:
                 decision = decisions.get(tc.id)
-                if (
-                    decision is not None
-                    and decision.action is not PolicyAction.EXECUTE
-                ):
+                blocked = decision is not None and (
+                    decision.action is PolicyAction.DENY
+                    or (
+                        decision.action is PolicyAction.REQUIRE_APPROVAL
+                        and getattr(self.tool_center, "approver", None)
+                        is None
+                    )
+                )
+                if blocked:
                     result = {
                         "content": decision.to_message(),
                         "is_error": True,
@@ -205,9 +212,13 @@ class ReactAgent:
         """pre_step 阶段：对整步工具调用做统一预检。
 
         预检只读、无副作用，返回 {tool_call_id: PolicyDecision}。
-        审批/危险/工作目录检测抽象在 agent_test.policy（跨工具复用），
+        危险/工作目录/审批决策抽象在 agent_test.policy（跨工具复用），
         bash 是首个接入的高危工具；ToolCenter.execute 内置同一策略作为
-        硬闸门（防绕过直接 execute），此处负责“决策先于副作用”的全量评审。
+        硬闸门。职责分工：
+        - DENY（破坏性/越界）：在 pre_step 直接拦截，决策先于任何副作用；
+        - REQUIRE_APPROVAL：未配置 approver 时在此拦截返回“需审批”；
+          配置了 approver 则放行到 ToolCenter 闸门做交互审批
+          （批准 -> 记住前缀 -> 执行；拒绝 -> 原因回传 LLM）。
         """
         policy = getattr(self.tool_center, "policy", None)
         decisions: dict[str, PolicyDecision] = {}
@@ -219,11 +230,15 @@ class ReactAgent:
                 continue
             decisions[tc.id] = policy.decide_tool(tc.name, tc.args_dict)
         for decision in decisions.values():
-            if decision.action is not PolicyAction.EXECUTE:
+            if decision.action is PolicyAction.DENY:
                 RuntimeLog.warning(
-                    "pre_step 拦截 tool=%s action=%s reasons=%s",
+                    "pre_step 拒绝 tool=%s reasons=%s",
                     decision.tool_name,
-                    decision.action.value,
                     "; ".join(decision.reasons),
+                )
+            elif decision.action is PolicyAction.REQUIRE_APPROVAL:
+                RuntimeLog.info(
+                    "pre_step 需审批 tool=%s（待 ToolCenter/approver 处理）",
+                    decision.tool_name,
                 )
         return decisions

@@ -175,6 +175,26 @@ class CommandPolicy:
             )
         return PolicyDecision(PolicyAction.EXECUTE, tool_name)
 
+    def add_allowlist_prefix(self, prefix: Sequence[str]) -> None:
+        """添加一条已审批命令前缀（会话级 remember）。"""
+        key = tuple(prefix)
+        if key and key not in self.allowlist_prefixes:
+            self.allowlist_prefixes.append(key)
+
+    def add_allowlist_for_command(self, command: str) -> None:
+        """把命令的“审批记忆前缀”加入 allowlist。
+
+        默认取命令前两个 token（如 git push origin main ->
+        ["git", "push"]），与 Claude Code “approve and remember” /
+        Codex “allow-and-remember” 的会话级放行语义一致：
+        同类命令后续不再逐条打扰用户。
+        """
+        tokens = command.strip().split()
+        if not tokens:
+            return
+        prefix = tokens if len(tokens) < 2 else tokens[:2]
+        self.add_allowlist_prefix(prefix)
+
     # ---------- 内部实现 ----------
 
     def _match_allowlist(self, command: str) -> bool:

@@ -19,16 +19,25 @@ from agent_test.types.tools import ToolCenterSchema, ToolSchema
 
 
 class ToolCenter:
-    def __init__(self, policy: "CommandPolicy | None" = None) -> None:
+    def __init__(
+        self,
+        policy: "CommandPolicy | None" = None,
+        approver: "AskService | None" = None,
+    ) -> None:
         """初始化工具中心。
 
         policy: 可选命令治理策略（agent_test.policy.CommandPolicy）。
                 传入后 execute 在调用工具前先做策略决策：DENY /
                 REQUIRE_APPROVAL 的命令不会执行，直接以 is_error=True
                 的工具结果返回（任何执行入口都受管控，防绕过）。
+        approver: 可选用户交互服务（agent_test.human.AskService）。
+                提供后，REQUIRE_APPROVAL 的命令会先征求用户批准：
+                批准 -> 记住命令前缀（会话级 allowlist）并执行；
+                拒绝 -> 以 is_error=True 的结果回传用户拒绝原因。
         """
         self.tools: Dict[str, ToolCenterSchema] = {}
         self.policy = policy
+        self.approver = approver
 
     def register(
         self,
@@ -95,11 +104,10 @@ class ToolCenter:
         # 策略硬闸门：除 Agent pre_step 外，任何直接 execute 也受管控
         if self.policy is not None:
             decision = self.policy.decide_tool(func_name, func_args)
-            if decision.action is not PolicyAction.EXECUTE:
+            if decision.action is PolicyAction.DENY:
                 RuntimeLog.warning(
-                    "ToolCenter 策略拦截 tool=%s action=%s reasons=%s",
+                    "ToolCenter 策略拒绝 tool=%s reasons=%s",
                     func_name,
-                    decision.action.value,
                     "; ".join(decision.reasons),
                 )
                 return {
@@ -108,6 +116,59 @@ class ToolCenter:
                     "blocked": True,
                     "policy_action": decision.action.value,
                 }
+            if decision.action is PolicyAction.REQUIRE_APPROVAL:
+                if self.approver is None:
+                    RuntimeLog.warning(
+                        "ToolCenter 需审批（未配置 approver）tool=%s",
+                        func_name,
+                    )
+                    return {
+                        "content": decision.to_message(),
+                        "is_error": True,
+                        "blocked": True,
+                        "policy_action": decision.action.value,
+                    }
+                # 批准继续进行：征求用户批准 -> 记住前缀 -> 正常执行
+                command = (decision.detail or {}).get("command", "")
+                approved, message = await self.approver.confirm(
+                    action=(
+                        f"执行命令: {command}"
+                        if command
+                        else f"执行工具 {func_name}"
+                    ),
+                    description="; ".join(decision.reasons),
+                )
+                if not approved:
+                    RuntimeLog.warning(
+                        "ToolCenter 审批被用户拒绝 tool=%s reason=%s",
+                        func_name,
+                        message,
+                    )
+                    return {
+                        "content": (
+                            f"审批被用户拒绝：{message}\n\n"
+                            f"{decision.to_message()}"
+                        ),
+                        "is_error": True,
+                        "blocked": True,
+                        "policy_action": "deny_by_user",
+                    }
+                if command:
+                    self.policy.add_allowlist_for_command(command)
+                RuntimeLog.info(
+                    "ToolCenter 审批通过并记住前缀 tool=%s command=%s",
+                    func_name,
+                    command[:300],
+                )
+        # bash 未指定 workdir 时，默认工作目录 = 策略允许根（沙箱），
+        # 与策略决策口径（default_cwd = allowed_roots[0]）保持一致
+        if (
+            self.policy is not None
+            and func_name == "bash"
+            and not func_args.get("workdir")
+            and self.policy.allowed_roots
+        ):
+            func_args = {**func_args, "workdir": str(self.policy.allowed_roots[0])}
         try:
             if func_name not in self.tools:
                 raise ToolExecutionError(

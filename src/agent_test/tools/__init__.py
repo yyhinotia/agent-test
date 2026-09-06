@@ -13,6 +13,7 @@ from agent_test.tools.builtin import (
     tool_center,
     write,
 )
+from agent_test.tools.ask import register_ask
 from agent_test.tools.bash import bash, register_bash
 from agent_test.tools.center import ToolCenter
 
@@ -21,6 +22,7 @@ __all__ = [
     "ToolCenter",
     "bash",
     "register_bash",
+    "register_ask",
     "register_builtins",
     "read",
     "find",

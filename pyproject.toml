@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-test"
-version = "0.3.0"
+version = "0.4.0"
 description = "基于 OpenAI Chat Completions 与 Pydantic v2 的模块化 ReAct Agent（uv 管理）"
 readme = "README.md"
 requires-python = ">=3.10"

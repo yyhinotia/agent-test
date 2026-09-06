@@ -38,13 +38,16 @@ agent-test/
 │   │   ├── adapter.py          #   LLMBaseAdapter / OPENAIAdapter（不再吞异常）
 │   │   └── registry.py         #   LLM_CLIENT 注册表（懒构建）
 │   ├── tools/                  # 工具
-│   │   ├── center.py           #   ToolCenter（注册/执行/策略闸门，错误降级为结果）
-│   │   ├── builtin.py          #   内置文件工具 + bash + tool_center 单例
-│   │   └── bash.py             #   bash 命令执行工具（stdout/stderr/退出码/超时）
+│   │   ├── center.py           #   ToolCenter（注册/执行/策略闸门/approver，错误降级为结果）
+│   │   ├── builtin.py          #   内置文件工具 + bash + ask_user + tool_center 单例
+│   │   ├── bash.py             #   bash 命令执行工具（stdout/stderr/退出码/超时）
+│   │   └── ask.py              #   ask_user/confirm 用户交互工具注册（接 AskService）
 │   ├── policy/                 # 命令治理（pre_step 拦截，跨工具复用）
 │   │   ├── policy.py           #   CommandPolicy：allowlist+规则+越界 -> 决策
 │   │   ├── rules.py            #   命令风险静态检测（deny/approve/warn）
 │   │   └── cwd.py              #   工作目录解析与工作区越界检测
+│   ├── human/                  # 用户交互（Human-in-the-Loop）
+│   │   └── service.py          #   AskService / ConsoleAskService（澄清/补充/批准）
 │   └── utils.py                # get_uuid / get_now
 ├── tests/                      # pytest 测试（本地离线）
 │   ├── test_core.py            # 核心组件冒烟测试（含 FakeLLM 驱动完整 ReAct 循环）
@@ -54,6 +57,7 @@ agent-test/
 │   ├── test_grep_tool.py       # grep 工具（正则匹配/跨文件分页）测试
 │   ├── test_list_write.py      # list_dir / write 工具测试
 │   ├── test_session_error_event.py  # 错误事实进 session、堆栈进日志的端到端测试
+│   ├── test_ask_user_tool.py        # ask_user/confirm 与批准继续（approver）测试
 │   ├── test_policy_pre_step.py      # 命令治理：风险/工作目录/审批与 pre_step 拦截
 │   └── test_bash_tool.py            # bash 执行层：回显/退出码/工作目录/超时
 ├── sessions/                   # 运行时生成：{session_id}.jsonl（会话事件，gitignore）
@@ -187,9 +191,48 @@ register_bash(center)
 agent = ReactAgent(tools=center, llm_client=...)
 
 # LLM 请求 bash("rm -rf /tmp/x") -> pre_step DENY，工具结果 is_error=True
-# LLM 请求 bash("git push ...")  -> pre_step REQUIRE_APPROVAL，等待审批
-# 审批通过后把前缀加入 allowlist（或临时放行）再重发调用即可执行
+# LLM 请求 bash("git push ...")  -> REQUIRE_APPROVAL：未配 approver 返回“需审批”；
+#   配置 approver 则征求批准，批准后记住前缀并执行（拒绝则原因回传 LLM）
 ```
+
+
+## ask_user / 用户交互工具（Human-in-the-Loop）
+
+设计参照主流 Agent 的 HITL 模式（Claude Code AskUserQuestion / canUseTool、
+Agno ask_user、Timbal suspend/confirm、LangGraph interrupt、Codex
+allow-and-remember），详见 `docs/hitl-tool-design-research.md`。
+
+### ask_user / confirm 工具（`agent_test.tools.ask`）
+
+- `ask_user(question, options?, multi_select?, header?)`：澄清任务 / 收集
+  **用户补充消息**。支持 2-4 个候选选项（用户可选项或输入其他内容）与多选；
+- `confirm(action, description?)`：请用户**批准继续进行**（如删除/提交/继续
+  某方案），返回 `approved` / `denied`（含原因）。
+- 二者通过可注入的 `AskService`（`agent_test.human`）呈现与收集回答：
+  默认 `ConsoleAskService`（CLI 交互），测试/网页/MCP 自行实现并注入即可；
+- 用户的回答作为 tool/result 写入 session，可回放、可回传 LLM 继续决策。
+
+### 批准继续 = 执行边界的闸门（对标 canUseTool / needsApproval）
+
+```python
+from agent_test import ReactAgent
+from agent_test.human.service import ConsoleAskService
+from agent_test.policy import CommandPolicy
+from agent_test.tools.bash import register_bash
+from agent_test.tools.center import ToolCenter
+
+center = ToolCenter(
+    policy=CommandPolicy(allowed_roots=["./workspace"]),
+    approver=ConsoleAskService(),   # 可选：配置后 REQUIRE_APPROVAL 自动征求批准
+)
+register_bash(center)
+agent = ReactAgent(tools=center, llm_client=...)
+```
+
+- 策略决策 `REQUIRE_APPROVAL`（如 git push）：**批准 -> `add_allowlist_for_command`
+  记住前缀（会话级，同类不再打扰）-> 执行**；**拒绝 -> 原因回传 LLM** 调整方案；
+- `DENY`（破坏性/越界）仍在 `ReactAgent._pre_step` 硬拦截，决策先于任何副作用；
+- 未配置 `approver` 时行为不变：直接返回“需要审批”的 is_error 结果。
 
 ## 会话持久化（Session + JSONL）
 

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from agent_test.policy import CommandPolicy
+from agent_test.tools.ask import register_ask
 from agent_test.tools.bash import register_bash
 from agent_test.tools.center import ToolCenter
 
@@ -421,8 +422,13 @@ def write(file_path: str, content: str, encoding: str = "utf-8"):
     return {"written": len(payload)}
 
 
-def register_builtins(center: ToolCenter) -> None:
-    """把全部内置工具注册到指定 ToolCenter。"""
+def register_builtins(
+    center: ToolCenter, *, ask_service: "AskService | None" = None
+) -> None:
+    """把全部内置工具（文件工具 + bash + ask_user/confirm）注册到指定 ToolCenter。
+
+    ask_service: 用户交互服务（缺省 ConsoleAskService，见 tools/ask.py）。
+    """
     center.register(
         desc="文件阅读工具",
         parameters=_READ_PARAMETERS,
@@ -455,6 +461,7 @@ def register_builtins(center: ToolCenter) -> None:
         required=["file_path", "content"],
     )(write)
     register_bash(center)
+    register_ask(center, ask_service)
 
 
 # 进程内共享的工具中心单例（内置文件工具 + bash 命令执行工具）

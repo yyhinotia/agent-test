@@ -695,3 +695,31 @@ Observability
    REQUIRE_APPROVAL、越界路径至少 REQUIRE_APPROVAL、allowlist 前缀直接放行。
 5. **测试与图谱**：新增 tests/test_policy_pre_step.py、tests/test_bash_tool.py
    （合计 27 例，全量 92 passed）；graphify-out 重新生成。
+
+
+---
+
+## 2026-09-06（续二）：ask_user / confirm 用户交互与“批准继续”（HITL）
+
+在 bash + policy 治理之上新增 Human-in-the-Loop 能力，先调研现行优秀 Agent
+设计（Claude Code AskUserQuestion / canUseTool、Agno ask_user、Timbal
+suspend/confirm、LangGraph interrupt、Codex allow-and-remember，来源与对照见
+`docs/hitl-tool-design-research.md`），再落地：
+
+1. **human 包**（`agent_test/human/service.py`）：可注入 `AskService`
+   （`ask_user` / `confirm`），默认 `ConsoleAskService` 走 CLI；
+   测试/UI 可脚本化回答。
+2. **ask_user / confirm 工具**（`agent_test/tools/ask.py`）：LLM 主动调用——
+   `ask_user` 澄清/补充消息（选项 + 多选 + 自由输入），`confirm` 批准继续；
+   回答作为 tool/result 落 session，可回放可回传 LLM。
+3. **批准继续 = 执行边界闸门**：`ToolCenter(approver=AskService)`；策略
+   `REQUIRE_APPROVAL` 时征求批准：批准 -> `CommandPolicy.add_allowlist_for_command`
+   记住前缀（会话级 remember，对标 approve-and-remember）-> 执行；
+   拒绝 -> `deny_by_user` 结果回传 LLM。
+4. **pre_step 分工调整**：`ReactAgent._pre_step` 只硬拦截 DENY 与
+   “无 approver 的 REQUIRE_APPROVAL”；配置 approver 后审批放行到
+   ToolCenter 闸门，保证被批动作在批准前零执行（决策先于副作用）。
+5. **cwd 口径统一**：策略存在时 bash 未指定 workdir 默认注入策略允许根，
+   与决策 `default_cwd = allowed_roots[0]` 一致。
+6. **测试与图谱**：新增 tests/test_ask_user_tool.py（12 例，全量 104 passed）；
+   graphify-out 重新生成。
