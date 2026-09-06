@@ -334,6 +334,9 @@ MODEL_NAME=qwen2.5-0.5b-instruct
 powershell -ExecutionPolicy Bypass -File scripts\start-qwen25-7b.ps1
 powershell -ExecutionPolicy Bypass -File scripts\start-qwen25-7b.ps1 -RunDemo "请调用 read 工具读取 README.md 前 10 行"
 powershell -ExecutionPolicy Bypass -File scripts\start-qwen25-7b.ps1 -Stop
+# start/stop 位置参数（start 为默认；stop 等价于 -Stop）：
+powershell -ExecutionPolicy Bypass -File scripts\start-qwen25-7b.ps1 start
+powershell -ExecutionPolicy Bypass -File scripts\start-qwen25-7b.ps1 stop
 # 3B 同理：scripts\start-qwen25-3b.ps1（默认端口 8081，ctx 16384）
 ```
 

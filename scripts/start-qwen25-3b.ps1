@@ -14,6 +14,8 @@
       运行 `uv run python main.py "<prompt>"`（无需手工改 .env）；
     - -Stop：按 PID 文件停止本脚本启动的服务。
 
+.PARAMETER Action
+    操作：start（默认，启动服务）或 stop（停止本脚本启动的服务），可作第一个位置参数传入。
 .PARAMETER Port
     服务端口，默认 8081。
 .PARAMETER ModelPath
@@ -40,6 +42,9 @@
 #>
 [CmdletBinding()]
 param(
+    [Parameter(Position = 0)]
+    [ValidateSet('start', 'stop')]
+    [string]$Action = 'start',
     [int]$Port = 8081,
     [string]$ModelPath = "",
     [string]$LlamaDir = "",
@@ -112,7 +117,7 @@ function Invoke-Demo([string]$prompt) {
     }
 }
 
-if ($Stop) { Stop-ServerOnPort $Port; exit 0 }
+if ($Stop -or $Action -eq 'stop') { Stop-ServerOnPort $Port; exit 0 }
 
 # ---- 幂等：端口已在服务本 alias ----
 $served = Get-ServedModelIds $Port
@@ -154,6 +159,6 @@ Write-Host "[ok] 就绪: http://127.0.0.1:$Port/v1  model=$alias (GPU 层数=$Gp
 Write-Host "     .env 可配置: BASE_URI=http://127.0.0.1:$Port/v1"
 Write-Host "                 MODEL_NAME=$alias"
 Write-Host "     日志: $stdoutLog"
-Write-Host "     停止: powershell -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Stop"
+Write-Host "     用法: powershell -ExecutionPolicy Bypass -File `"$PSCommandPath`" start | stop"
 
 if ($RunDemo) { Invoke-Demo $RunDemo }
