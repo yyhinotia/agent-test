@@ -600,3 +600,71 @@ Observability
 | 状态 | `Session` + JSONL 事件流 | Checkpoint / 快照 / Trace |
 | 通信 | `Inbox / Outbox` | MessageBus / RPC / Redis 队列 |
 | 平台化 | —— | Service Registry / Capability / Permission / MCP |
+---
+
+## 2026-09-06：模块化重构 + 日志 / 异常体系落地
+
+### 本次重构交付
+
+1. **uv 化**：`pyproject.toml` 改用 hatchling build backend + PEP 735
+   `[dependency-groups]` dev；删除 requirements.txt；`.venv` 与 `uv.lock`
+   由 `uv sync` 管理；测试通过 `uv run pytest` 执行。
+2. **模块化结构**：扁平 `src/*.py` -> `src/agent_test/` 按功能分包：
+   `exceptions / log / types / core / session / llm / tools`。
+3. **log 模块**（`agent_test.log.runtime_log.RuntimeLog`）：所有
+   agent-runtime 日志在输出控制台的同时额外写入 `logs/runtime.log`；
+   异常以 ERROR 级别记录**完整 traceback**；contextvars 自动携带
+   session_id / turn / step，支持 async 任务内传播；`capture_exception`
+   返回可在 session 中落盘的结构化摘要。
+4. **异常体系**（`agent_test.exceptions`）：`AgentBaseError(Exception)`
+   统一基类（替代方案中“baseException”命名，避免直接继承内置
+   `BaseException` 吞系统信号）；`SessionEditError`、`MessageEditError`、
+   `LlmError`（retryable）、`ToolExecutionError`、`SessionContinuityError`。
+5. **错误分层落盘**：错误事实（location / error_type / message）写入
+   session 的 `runtime/error` 事件；完整堆栈写入日志文件；二者按
+   session_id 关联，便于回放与排查。
+6. **顺带修复三个基础缺陷**：
+   - LLM 异常不再被吞（原 `except: end_reason="error"`）-> 抛 `LlmError`
+     并保留原始异常链；
+   - step 产出即持久化，消除“先入 inbox 再兜底补记”的最终回答丢失窗口；
+   - session seq 改用持久化游标，from_file 恢复后继续追加仍连续，
+     并新增 seq 连续性校验（strict 模式抛 SessionContinuityError）。
+7. **回归保障**：原有 10 个测试全部迁移到 `agent_test.*` 导入并新增
+   异常 / 日志 / 错误事件端到端测试，`uv run pytest -v` 全绿。
+
+### 目录对照（扁平 -> 模块化）
+
+| 旧（src/*.py） | 新（src/agent_test/） |
+| --- | --- |
+| types.py（消息/事件/Schema/基类） | types/messages.py、types/events.py、types/tools.py；llm/adapter.py（基类） |
+| session.py | session/session.py |
+| inbox.py | core/inbox.py |
+| llm_adapter.py | llm/adapter.py + llm/registry.py |
+| tools.py | tools/center.py + tools/builtin.py |
+| agent.py | core/agent.py |
+| utils.py | utils.py |
+| （无） | exceptions/（base/session/message/llm/tools） |
+| （无） | log/runtime_log.py |
+
+
+---
+
+## 2026-09-06（收尾）：完成剩余重构任务
+
+在「模块化重构 + 日志 / 异常体系落地」基础上补齐的收尾项：
+
+1. **MessageEditError 真正落地**：`ToolCallBlock.args_dict` 解析工具调用
+   参数 JSON 失败时抛出 `MessageEditError`（location=ToolCallBlock.args_dict，
+   detail 含 tool_call_id / name，并保留原始 JSONDecodeError 异常链）——
+   session 回放中的 error_type 因此更有语义，完整堆栈仍进日志文件。
+2. **日志记录原始异常堆栈**：`Session.append` 在事件类型非法 / 持久化
+   写入失败时，日志记录**原始** ValueError / OSError 的真实堆栈（而非
+   包装异常的构造帧），对外仍抛统一领域异常 SessionEditError。
+3. **Session.from_file 健壮化**：文件打开 / 读取失败（OSError）与某行
+   JSON / 校验失败统一包装为 `SessionEditError`（location + 行号 detail），
+   完整堆栈写入日志文件；strict 模式的 seq 断层仍抛 SessionContinuityError。
+4. **测试补强**：新增 MessageEditError 触发、日志记录原始堆栈、
+   from_file 损坏行、端到端错误事件回放测试；
+   `uv run pytest -v` 全绿（65 passed）。
+5. **文档与图谱同步**：README 目录树 / 内置工具 / 测试清单更新；
+   graphify-out 按新模块结构重新生成。

@@ -1,0 +1,119 @@
+"""工具中心：注册、管理并执行工具。
+
+工具内部异常不向上抛（要回传给 LLM 做下一步决策）：
+- 完整堆栈写入日志文件（RuntimeLog.capture_exception）；
+- 错误事实通过返回的 {"content": str, "is_error": True} 进入
+  tool/result 事件，供 LLM 与回放使用。
+"""
+from __future__ import annotations
+
+import inspect
+import json
+import logging
+from typing import Any, Callable, Dict, List
+
+from agent_test.exceptions.tools import ToolExecutionError
+from agent_test.log.runtime_log import RuntimeLog
+from agent_test.types.tools import ToolCenterSchema, ToolSchema
+
+
+class ToolCenter:
+    def __init__(self) -> None:
+        self.tools: Dict[str, ToolCenterSchema] = {}
+
+    def register(
+        self,
+        desc: str,
+        parameters: Dict,
+        required: List[str] | None = None,
+        name: str | None = None,
+    ):
+        """工具注册装饰器。
+
+        同名工具若仍可用（usable=True）则抛 ToolExecutionError；
+        已被 unregister 标记不可用的同名工具允许重新注册。
+
+        name: 可选，显式指定注册名（工具 schema 名）；缺省用函数名。
+            用于需要与 Python 函数名解耦的场景（如工具名与 builtins
+            冲突时，函数叫 list_dir、注册名为 list）。
+        """
+
+        def wrap(func: Callable):
+            func_name = name or func.__name__
+            existing = self.tools.get(func_name)
+            if existing is not None and existing.usable:
+                raise ToolExecutionError(
+                    f"工具 {func_name} 重复注册",
+                    location="ToolCenter.register",
+                )
+            center_schema = ToolCenterSchema(
+                tool_schema=ToolSchema(
+                    name=func_name,
+                    description=desc,
+                    parameters=parameters,
+                    required=required or [],
+                ),
+                func=func,
+                usable=True,
+            )
+            self.tools[func_name] = center_schema
+
+            def wrap_in(*args, **kwargs):
+                return func(*args, **kwargs)
+
+            return wrap_in
+
+        return wrap
+
+    def unregister(self, tool_name: str) -> None:
+        """工具取消注册（标记不可用；保留条目以便可再次注册）。"""
+        if tool_name not in self.tools:
+            return
+        self.tools[tool_name].usable = False
+
+    def get_schemas(self) -> List[Dict[str, Any]] | None:
+        """获取全部可用工具的 OpenAI function calling schema。"""
+        schemas = []
+        for item in self.tools.values():
+            if not item.usable:
+                continue
+            schemas.append(item.tool_schema.to_openai_schema())
+        return schemas if schemas else None
+
+    async def execute(self, func_name: str, func_args: Dict) -> Dict[str, Any]:
+        """执行指定工具，返回 {"content": str, "is_error": bool}。"""
+        return_data: Dict[str, Any] = {"content": "", "is_error": False}
+        try:
+            if func_name not in self.tools:
+                raise ToolExecutionError(
+                    f"工具未注册: {func_name}", location="ToolCenter.execute"
+                )
+            if not self.tools[func_name].usable:
+                raise ToolExecutionError(
+                    f"工具 {func_name} 不可执行", location="ToolCenter.execute"
+                )
+            func = self.tools[func_name].func
+            if inspect.iscoroutinefunction(func):
+                tool_return = await func(**func_args)
+            else:
+                tool_return = func(**func_args)
+            if isinstance(tool_return, str):
+                return_data["content"] = tool_return
+            else:
+                return_data["content"] = json.dumps(tool_return, ensure_ascii=False)
+        except ToolExecutionError as exc:
+            RuntimeLog.capture_exception(
+                exc,
+                location=exc.location or "ToolCenter.execute",
+                level=logging.WARNING,
+            )
+            return_data = {"content": str(exc), "is_error": True}
+        except Exception as exc:  # noqa: BLE001
+            RuntimeLog.capture_exception(
+                exc,
+                location=f"ToolCenter.execute({func_name})",
+                level=logging.WARNING,
+            )
+            return_data = {"content": f"工具执行失败: {exc}", "is_error": True}
+        finally:
+            return return_data

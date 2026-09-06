@@ -1,11 +1,11 @@
 [build-system]
-requires = ["setuptools>=68"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [project]
-name = "react-openai-agent"
-version = "0.1.0"
-description = "基于 OpenAI Chat Completions 与 Pydantic v2 的 ReAct Agent 脚手架"
+name = "agent-test"
+version = "0.2.0"
+description = "基于 OpenAI Chat Completions 与 Pydantic v2 的模块化 ReAct Agent（uv 管理）"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -14,11 +14,14 @@ dependencies = [
     "python-dotenv>=1.0",
 ]
 
-[project.optional-dependencies]
-dev = ["pytest>=8.0"]
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
 
-[tool.setuptools.packages.find]
-include = ["src*"]
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent_test"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]

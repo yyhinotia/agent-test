@@ -7,3 +7,6 @@ dist/
 build/
 *.egg-info/
 sessions/
+logs/
+.idea/
+graphify-out/cache/

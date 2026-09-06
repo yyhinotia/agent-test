@@ -1,25 +1,21 @@
 """核心组件的本地冒烟测试（不依赖网络 / API Key）。"""
 import asyncio
-import sys
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from src.inbox import InBox
-from src.llm_adapter import LLM_CLIENT
-from src.session import Session
-from src.tools import ToolCenter
-from src.types import (
+from agent_test.core.inbox import InBox
+from agent_test.llm.adapter import LLMBaseAdapter
+from agent_test.llm.registry import LLM_CLIENT
+from agent_test.session.session import Session
+from agent_test.tools import ToolCenter
+from agent_test.types.messages import (
     AssistantMessage,
-    LLMBaseAdapter,
     Message,
     TextBlock,
     ToolCallBlock,
     ToolResultMessage,
-    ToolSchema,
     UserMessage,
 )
-from src.utils import get_now, get_uuid
+from agent_test.types.tools import ToolSchema
+from agent_test.utils import get_now, get_uuid
 
 
 def test_uuid_and_now():
@@ -28,7 +24,9 @@ def test_uuid_and_now():
 
 
 def test_tool_call_block_args_dict():
-    block = ToolCallBlock(id="call_1", name="read", args='{"file_path": "a.txt"}')
+    block = ToolCallBlock(
+        id="call_1", name="read", args='{"file_path": "a.txt"}'
+    )
     assert block.args_dict == {"file_path": "a.txt"}
 
 
@@ -108,9 +106,7 @@ def test_session_persist_roundtrip(tmp_path):
     tool_result = ToolResultMessage(
         tool_call_id="c1", content=[TextBlock(content="ok")], is_error=False
     )
-    assistant_msg = AssistantMessage(
-        id="a1", content=[TextBlock(content="done")]
-    )
+    assistant_msg = AssistantMessage(id="a1", content=[TextBlock(content="done")])
     session.append("user/message", data=user_msg)
     session.append("tool/result", data=tool_result)
     session.append("assistant/message", data=assistant_msg)
@@ -122,6 +118,16 @@ def test_session_persist_roundtrip(tmp_path):
     assert restored.events == session.events
     assert restored.derive_messages() == session.derive_messages()
     assert restored.derive_messages() == [user_msg, tool_result, assistant_msg]
+
+
+def test_session_seq_continues_after_from_file(tmp_path):
+    """持久化游标：from_file 恢复后继续 append，seq 依然连续。"""
+    session = Session(session_id="s-002", persist_dir=str(tmp_path))
+    session.append("turn/start", data={"turn": 1})
+    restored = Session.from_file("s-002", persist_dir=str(tmp_path))
+    restored.append("turn/end", data={"turn": 1})
+    seqs = [e.seq for e in restored.events]
+    assert seqs == [0, 1]
 
 
 def test_tool_center_register_and_execute():
@@ -159,7 +165,7 @@ def test_agent_constructs_with_env(monkeypatch, tmp_path):
     monkeypatch.setenv("API_KEY", "sk-test")
     monkeypatch.setenv("BASE_URI", "https://api.openai.com/v1")
     monkeypatch.setenv("MODEL_NAME", "gpt-4o-mini")
-    from src.agent import ReactAgent
+    from agent_test import ReactAgent
 
     agent = ReactAgent(persist_dir=str(tmp_path))
     assert agent.phase.turn == 0
@@ -173,8 +179,8 @@ def test_agent_constructs_with_env(monkeypatch, tmp_path):
 
 def test_react_agent_loop_with_fake_llm(monkeypatch, tmp_path):
     """用假 LLM 驱动完整 ReAct 循环：工具调用 -> 工具结果 -> 最终回答。"""
-    from src.agent import ReactAgent
-    from src.tools import tool_center as shared_tool_center
+    from agent_test import ReactAgent
+    from agent_test.tools import tool_center as shared_tool_center
 
     LLM_CLIENT.clear()
     monkeypatch.setenv("API_KEY", "sk-test")
