@@ -38,8 +38,13 @@ agent-test/
 │   │   ├── adapter.py          #   LLMBaseAdapter / OPENAIAdapter（不再吞异常）
 │   │   └── registry.py         #   LLM_CLIENT 注册表（懒构建）
 │   ├── tools/                  # 工具
-│   │   ├── center.py           #   ToolCenter（注册/执行，错误降级为结果）
-│   │   └── builtin.py          #   内置 read/find/grep/edit/list/write 工具 + tool_center 单例
+│   │   ├── center.py           #   ToolCenter（注册/执行/策略闸门，错误降级为结果）
+│   │   ├── builtin.py          #   内置文件工具 + bash + tool_center 单例
+│   │   └── bash.py             #   bash 命令执行工具（stdout/stderr/退出码/超时）
+│   ├── policy/                 # 命令治理（pre_step 拦截，跨工具复用）
+│   │   ├── policy.py           #   CommandPolicy：allowlist+规则+越界 -> 决策
+│   │   ├── rules.py            #   命令风险静态检测（deny/approve/warn）
+│   │   └── cwd.py              #   工作目录解析与工作区越界检测
 │   └── utils.py                # get_uuid / get_now
 ├── tests/                      # pytest 测试（本地离线）
 │   ├── test_core.py            # 核心组件冒烟测试（含 FakeLLM 驱动完整 ReAct 循环）
@@ -48,7 +53,9 @@ agent-test/
 │   ├── test_builtin_tools.py   # 内置 find/edit 工具行为测试
 │   ├── test_grep_tool.py       # grep 工具（正则匹配/跨文件分页）测试
 │   ├── test_list_write.py      # list_dir / write 工具测试
-│   └── test_session_error_event.py  # 错误事实进 session、堆栈进日志的端到端测试
+│   ├── test_session_error_event.py  # 错误事实进 session、堆栈进日志的端到端测试
+│   ├── test_policy_pre_step.py      # 命令治理：风险/工作目录/审批与 pre_step 拦截
+│   └── test_bash_tool.py            # bash 执行层：回显/退出码/工作目录/超时
 ├── sessions/                   # 运行时生成：{session_id}.jsonl（会话事件，gitignore）
 └── logs/                       # 运行时生成：runtime.log（完整日志，gitignore）
 ```
@@ -110,6 +117,78 @@ try:
     await agent.turn()
 finally:
     RuntimeLog.unbind(tokens)
+```
+
+
+## Bash 命令执行工具与命令治理（pre_step 抽象）
+
+### bash 工具（`agent_test.tools.bash`）
+
+- 入参：`command`（必填）、`workdir`、`timeout`、`encoding`、`max_output_chars`；
+- 返回：`{command, cwd, exit_code, stdout, stderr, timed_out, truncated}` ——
+  `stdout` 为成功回显、`stderr` 为 err 回显，二者分开返回并附退出码；
+- 跨平台：Windows 走 `cmd.exe`（COMSPEC）、POSIX 走 `/bin/sh`，工具名叫
+  bash、语义是“执行一条命令”；
+- 异步执行：`asyncio.create_subprocess_shell`，不阻塞 agent 事件循环，
+  超时自动 kill 并标记 `timed_out=True`；
+- 审计日志：每次执行把 command / cwd / exit_code / 输出长度写入
+  `logs/runtime.log`；参数级错误抛 `ToolExecutionError`，由 ToolCenter 统一
+  降级为 `is_error=True` 的工具结果（完整堆栈进日志文件）。
+
+### 审批 / 检测 / 工作目录检测：抽象到 pre_step 阶段？
+
+**结论：应该抽象成跨工具的 pre_step 拦截，而不是写死在 bash 内部。** 理由：
+
+1. **跨工具复用**：权限审批 / 危险命令检测 / 工作目录越界不是 bash 专属，
+   write、删除、网络、安装类工具将来同样需要；放进工具内部会重复且易漏；
+2. **决策先于副作用**：一步（step）内可能同时请求多个工具调用；只有先对
+   **整步所有调用**做一次“全量预检”，才能避免“先执行了允许的、再拦下
+   拒绝的”造成的部分副作用；
+3. **可观测、可回放**：拒绝 / 需审批不是异常，而是统一以 `is_error=True`
+   的 tool/result 回传 LLM 并落 session；决策动作与原因同时写日志，便于审计；
+4. **防绕过**：单点硬闸门保证任何执行入口都受管控。
+
+因此治理抽到新包 `agent_test.policy`，并在两层落地：
+
+- `ToolCenter.execute` 内置**策略硬闸门**：`ToolCenter(policy=...)` 后任何
+  直接 execute 也先决策；DENY / REQUIRE_APPROVAL 不执行，直接返回
+  `{"is_error": True, "blocked": True, "policy_action": ...}`；
+- `ReactAgent._step` 新增 **pre_step 阶段**（`_pre_step`）：在副作用前对整步
+  工具调用做全量评审，未放行调用直接生成拦截结果，不进 execute。
+
+bash 是第一个接入的高危工具；后续工具只需在 `CommandPolicy.decide_tool`
+登记自己的“策略画像”，Agent / ToolCenter 无需改动。
+
+### 决策流程（`CommandPolicy.decide`）
+
+1. **工作目录检测**（`policy/cwd.py`）：解析 workdir（缺省取默认目录）→ 必须
+   存在且为目录 → 真实路径必须位于 `allowed_roots` 允许工作区内（越界 DENY）；
+2. **已审批前缀 allowlist**：命令头部命中（如 `["git", "push"]`）直接放行；
+3. **静态风险检测**（`policy/rules.py`）：正则三档命中 ——
+   `deny`（rm -rf / del /s /q / Remove-Item / format / diskpart 等，直接拒绝）、
+   `approve`（git push / reset --hard / 安装 / 网络 / 注册表 / 服务变更，需审批）、
+   `warn`（提示性）；
+4. **工作区外路径检测**：命令涉及允许工作区之外的绝对路径，保守地至少要求审批。
+
+默认单例 `tool_center` 挂载 `CommandPolicy(allowed_roots=[Path.cwd()])`
+（进程启动目录即沙箱工作区）；需要更宽松/更严格边界时自行构造
+`ToolCenter(policy=CommandPolicy(...))` 传入 Agent。
+
+### 使用示例
+
+```python
+from agent_test import ReactAgent
+from agent_test.policy import CommandPolicy
+from agent_test.tools.bash import register_bash
+from agent_test.tools.center import ToolCenter
+
+center = ToolCenter(policy=CommandPolicy(allowed_roots=["./workspace"]))
+register_bash(center)
+agent = ReactAgent(tools=center, llm_client=...)
+
+# LLM 请求 bash("rm -rf /tmp/x") -> pre_step DENY，工具结果 is_error=True
+# LLM 请求 bash("git push ...")  -> pre_step REQUIRE_APPROVAL，等待审批
+# 审批通过后把前缀加入 allowlist（或临时放行）再重发调用即可执行
 ```
 
 ## 会话持久化（Session + JSONL）

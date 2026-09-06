@@ -668,3 +668,30 @@ Observability
    `uv run pytest -v` 全绿（65 passed）。
 5. **文档与图谱同步**：README 目录树 / 内置工具 / 测试清单更新；
    graphify-out 按新模块结构重新生成。
+
+
+---
+
+## 2026-09-06（续）：Bash 命令执行工具与命令治理（pre_step 抽象）
+
+在模块化重构与日志/异常体系之上新增“命令执行 + 权限治理”能力，回答并落地
+“审批/检测是否抽象到 pre_step 阶段”的问题。
+
+1. **bash 工具**（`agent_test/tools/bash.py`）：异步执行一条 shell/cmd 命令
+   （Windows cmd.exe / POSIX sh），返回 stdout（成功回显）/ stderr（err 回显）/
+   exit_code / cwd / timed_out；输出可截断；每次执行写审计日志；
+   参数级错误抛 ToolExecutionError（堆栈进日志、事实进 session）。
+2. **治理层独立成包**（`agent_test/policy/`）：cwd.py（工作目录解析 + 允许
+   工作区越界检测）、rules.py（deny/approve/warn 三档静态风险规则）、
+   policy.py（CommandPolicy：allowlist 前缀 + 规则 + 越界 -> PolicyDecision）。
+3. **抽象结论：审批/检测放 pre_step（跨工具拦截层），而非写死在 bash 内**：
+   - ToolCenter.execute 内嵌策略硬闸门（任何直接 execute 也受管控，防绕过）；
+   - ReactAgent._step 新增 `_pre_step` 阶段：副作用前对整步工具调用全量评审，
+     未放行调用直接以 is_error 的 tool/result 进 session（可回放、可回传 LLM）；
+   - 拒绝/需审批按 PolicyDecision（EXECUTE / REQUIRE_APPROVAL / DENY）建模，
+     均不抛异常，符合“工具错误降级为结果”的既有协议。
+4. **默认策略**：全局 `tool_center` 单例挂
+   `CommandPolicy(allowed_roots=[Path.cwd()])`；破坏性命令 DENY、影响面大命令
+   REQUIRE_APPROVAL、越界路径至少 REQUIRE_APPROVAL、allowlist 前缀直接放行。
+5. **测试与图谱**：新增 tests/test_policy_pre_step.py、tests/test_bash_tool.py
+   （合计 27 例，全量 92 passed）；graphify-out 重新生成。

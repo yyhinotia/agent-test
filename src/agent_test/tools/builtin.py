@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import os
 import re
+from pathlib import Path
 from typing import Any, Dict
 
+from agent_test.policy import CommandPolicy
+from agent_test.tools.bash import register_bash
 from agent_test.tools.center import ToolCenter
 
 # 遍历目录时跳过的噪音目录（隐藏目录 + 常见缓存/依赖目录）
@@ -451,8 +454,11 @@ def register_builtins(center: ToolCenter) -> None:
         parameters=_WRITE_PARAMETERS,
         required=["file_path", "content"],
     )(write)
+    register_bash(center)
 
 
-# 进程内共享的工具中心单例（包含内置 read/find/grep/edit/list/write）
-tool_center = ToolCenter()
+# 进程内共享的工具中心单例（内置文件工具 + bash 命令执行工具）
+# 默认启用命令治理策略：allowed_roots 取进程启动目录作为沙箱工作区；
+# 需要更宽松/更严格边界时自行构造 ToolCenter(policy=CommandPolicy(...))。
+tool_center = ToolCenter(policy=CommandPolicy(allowed_roots=[Path.cwd()]))
 register_builtins(tool_center)

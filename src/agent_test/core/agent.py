@@ -15,6 +15,7 @@ from __future__ import annotations
 from agent_test.core.inbox import InBox
 from agent_test.llm.registry import LLM_CLIENT
 from agent_test.log.runtime_log import RuntimeLog
+from agent_test.policy import PolicyAction, PolicyDecision
 from agent_test.session.session import Session
 from agent_test.tools import tool_center
 from agent_test.types.events import EventType, Phase
@@ -56,7 +57,7 @@ class ReactAgent:
 
         不传依赖时使用默认值：
         - llm_client: LLM_CLIENT["openai"]（懒构建，需要 API_KEY 等环境变量）
-        - tools:      全局 tool_center 单例（含内置 read/find/grep/edit/list/write 工具）
+        - tools:      全局 tool_center 单例（含内置 read/find/grep/edit/list/write 与 bash 命令执行工具）
         - inbox / session: 新建本 Agent 私有实例
         """
         self.tool_center = tools if tools is not None else tool_center
@@ -146,8 +147,25 @@ class ReactAgent:
                 for block in assistant_message.content
                 if isinstance(block, ToolCallBlock)
             ]
+            # pre_step：整步工具调用先做一次“全量预检”（审批/危险/
+            # 工作目录检测），决策先于任何副作用；未放行的调用不再执行。
+            decisions = self._pre_step(tool_calls)
             for tc in tool_calls:
-                result = await self.tool_center.execute(tc.name, tc.args_dict)
+                decision = decisions.get(tc.id)
+                if (
+                    decision is not None
+                    and decision.action is not PolicyAction.EXECUTE
+                ):
+                    result = {
+                        "content": decision.to_message(),
+                        "is_error": True,
+                        "blocked": True,
+                        "policy_action": decision.action.value,
+                    }
+                else:
+                    result = await self.tool_center.execute(
+                        tc.name, tc.args_dict
+                    )
                 tool_result = ToolResultMessage(
                     tool_call_id=tc.id,
                     content=[TextBlock(content=result["content"])],
@@ -180,3 +198,32 @@ class ReactAgent:
                     self.session.file_path,
                 )
             return "error"
+
+    def _pre_step(
+        self, tool_calls: list[ToolCallBlock]
+    ) -> dict[str, PolicyDecision]:
+        """pre_step 阶段：对整步工具调用做统一预检。
+
+        预检只读、无副作用，返回 {tool_call_id: PolicyDecision}。
+        审批/危险/工作目录检测抽象在 agent_test.policy（跨工具复用），
+        bash 是首个接入的高危工具；ToolCenter.execute 内置同一策略作为
+        硬闸门（防绕过直接 execute），此处负责“决策先于副作用”的全量评审。
+        """
+        policy = getattr(self.tool_center, "policy", None)
+        decisions: dict[str, PolicyDecision] = {}
+        for tc in tool_calls:
+            if policy is None:
+                decisions[tc.id] = PolicyDecision(
+                    action=PolicyAction.EXECUTE, tool_name=tc.name
+                )
+                continue
+            decisions[tc.id] = policy.decide_tool(tc.name, tc.args_dict)
+        for decision in decisions.values():
+            if decision.action is not PolicyAction.EXECUTE:
+                RuntimeLog.warning(
+                    "pre_step 拦截 tool=%s action=%s reasons=%s",
+                    decision.tool_name,
+                    decision.action.value,
+                    "; ".join(decision.reasons),
+                )
+        return decisions

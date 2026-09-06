@@ -14,12 +14,21 @@ from typing import Any, Callable, Dict, List
 
 from agent_test.exceptions.tools import ToolExecutionError
 from agent_test.log.runtime_log import RuntimeLog
+from agent_test.policy import CommandPolicy, PolicyAction
 from agent_test.types.tools import ToolCenterSchema, ToolSchema
 
 
 class ToolCenter:
-    def __init__(self) -> None:
+    def __init__(self, policy: "CommandPolicy | None" = None) -> None:
+        """初始化工具中心。
+
+        policy: 可选命令治理策略（agent_test.policy.CommandPolicy）。
+                传入后 execute 在调用工具前先做策略决策：DENY /
+                REQUIRE_APPROVAL 的命令不会执行，直接以 is_error=True
+                的工具结果返回（任何执行入口都受管控，防绕过）。
+        """
         self.tools: Dict[str, ToolCenterSchema] = {}
+        self.policy = policy
 
     def register(
         self,
@@ -83,6 +92,22 @@ class ToolCenter:
     async def execute(self, func_name: str, func_args: Dict) -> Dict[str, Any]:
         """执行指定工具，返回 {"content": str, "is_error": bool}。"""
         return_data: Dict[str, Any] = {"content": "", "is_error": False}
+        # 策略硬闸门：除 Agent pre_step 外，任何直接 execute 也受管控
+        if self.policy is not None:
+            decision = self.policy.decide_tool(func_name, func_args)
+            if decision.action is not PolicyAction.EXECUTE:
+                RuntimeLog.warning(
+                    "ToolCenter 策略拦截 tool=%s action=%s reasons=%s",
+                    func_name,
+                    decision.action.value,
+                    "; ".join(decision.reasons),
+                )
+                return {
+                    "content": decision.to_message(),
+                    "is_error": True,
+                    "blocked": True,
+                    "policy_action": decision.action.value,
+                }
         try:
             if func_name not in self.tools:
                 raise ToolExecutionError(
