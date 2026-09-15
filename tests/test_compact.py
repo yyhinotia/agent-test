@@ -70,9 +70,11 @@ def test_compactor_single_turn_multi_step_keeps_recent_steps(tmp_path):
     assert len(summaries) == 1
 
     # 最近 2 个 step（4、5）保留，更早的 step（0..3，含用户消息）被压缩
-    compacted = [e for e in events if e.compacted]
-    assert len(compacted) == 7  # 用户消息 + step1..3 的 assistant/tool 各 2 条
-    assert all(e.step <= 3 for e in compacted)
+    # 内存窗口化：被压缩旧事件从 events 移除，
+    # 只保留 compact 摘要 + 最近 step(4/5) 的 4 条事件
+    assert not any(e.compacted for e in events), "内存不应残留 compacted 事件"
+    assert len(events) == 5  # compact 摘要 + step4/5 的 assistant/tool 各 2 条
+    assert all(e.type == EventType.COMPACT.value or e.step >= 4 for e in events)
 
     msgs = session.derive_messages()
     assert any(
@@ -92,8 +94,10 @@ def test_compactor_single_turn_multi_step_keeps_recent_steps(tmp_path):
         for m in msgs
     )
 
-    # 持久化 roundtrip：seq 集合连续、消息一致
+    # 持久化 roundtrip：磁盘是全量归档（含 7 条 compacted），
+    # seq 连续，derive 与内存窗口一致（compacted 事件被跳过）
     restored = Session.from_file(session.session_id, persist_dir=str(tmp_path))
+    assert len([e for e in restored.events if e.compacted]) == 7
     assert sorted(e.seq for e in restored.events) == list(
         range(len(restored.events))
     )
@@ -262,9 +266,10 @@ def test_agent_context_window_10000_compacts_normally(tmp_path):
         assert asyncio.run(agent.turn()) is True
 
     events = agent.session.events
-    assert any(e.compacted for e in events), "上下文窗口 10000 下应触发压缩"
     summaries = [e for e in events if e.type == EventType.COMPACT.value]
-    assert len(summaries) >= 1
+    assert len(summaries) >= 1, "上下文窗口 10000 下应触发压缩"
+    # 内存窗口化：events 即上下文窗口，无 compacted 残留
+    assert not any(e.compacted for e in events), "内存不应残留 compacted 事件"
 
     msgs = agent.session.derive_messages()
     # 最近回合（turn5）完整保留：用户问题与最终回答都在
@@ -287,12 +292,14 @@ def test_agent_context_window_10000_compacts_normally(tmp_path):
         for m in msgs
     )
 
-    # 正常：持久化 roundtrip 后 seq 连续、消息一致
+    # 正常：磁盘保持全量归档（含被压缩事件），
+    # roundtrip seq 连续、derive 与内存窗口一致
     restored = Session.from_file(
         agent.session.session_id, persist_dir=str(tmp_path / "sessions")
     )
     seqs = [e.seq for e in restored.events]
     assert sorted(seqs) == list(range(len(seqs)))
+    assert any(e.compacted for e in restored.events), "磁盘应保留被压缩事件"
     assert restored.derive_messages() == agent.session.derive_messages()
 
 # ---------- 单元：usage 降级（非流式兜底请求，知识包 3.4） ----------
@@ -357,3 +364,68 @@ def test_fetch_usage_fallback_failure_returns_none():
 
     adapter2 = _fallback_adapter(no_usage)
     assert asyncio.run(adapter2._fetch_usage_fallback([], None)) is None
+
+# ---------- 单元：内存窗口化（events 只作上下文窗口，磁盘保全量） ----------
+
+
+def test_compactor_memory_window_keeps_disk_full(tmp_path):
+    """压缩后内存只保留上下文窗口，磁盘保持全量历史。
+
+    窗口化优化 + 知识包契约：
+    - 内存 events 不再残留 compacted 事件（只含 compact 摘要 + 最近事件）；
+    - 磁盘 JSONL 始终是全量 0..N-1 序列（被压缩事件完整持久化）；
+    - 窗口化后 append 的 seq 仍全局连续；from_file 恢复全量且 derive 一致；
+    - 二次压缩稳定：磁盘全量不丢、seq 保持连续。
+    """
+    session = Session(persist_dir=str(tmp_path))
+    for turn in (1, 2, 3):
+        session.append(
+            "user/message", data=_user(f"Q{turn}"), turn=turn, step=0
+        )
+        session.append(
+            "assistant/message",
+            data=_assistant(f"A{turn}-1"),
+            turn=turn,
+            step=(turn - 1) * 2 + 1,
+        )
+        session.append(
+            "tool/result", data=_tool(f"R{turn}"), turn=turn, step=(turn - 1) * 2 + 1
+        )
+        session.append(
+            "assistant/message",
+            data=_assistant(f"A{turn}-2"),
+            turn=turn,
+            step=(turn - 1) * 2 + 2,
+        )
+    compact_total = len(session.events)  # 12
+
+    compactor = Compactor(session=session, summarize=lambda text: "SUMMARY")
+    asyncio.run(compactor.compact())
+
+    # 内存 = 上下文窗口：compact 摘要 + 最近 step(5/6) 的 3 条，无 compacted 残留
+    assert not any(e.compacted for e in session.events)
+    assert any(e.type == EventType.COMPACT.value for e in session.events)
+    assert len(session.events) == 4  # 摘要 + A3-1/R3/A3-2
+
+    # 磁盘全量：12 条原始事件 + 摘要，其中 9 条 compacted=True 完整落盘
+    restored = Session.from_file(session.session_id, persist_dir=str(tmp_path))
+    assert len(restored.events) == compact_total + 1
+    assert len([e for e in restored.events if e.compacted]) == 9
+    assert sorted(e.seq for e in restored.events) == list(
+        range(len(restored.events))
+    )
+    assert restored.derive_messages() == session.derive_messages()
+
+    # 窗口化后 append：seq 全局连续，磁盘继续追加
+    before_max = max(e.seq for e in session.events)
+    session.append("user/message", data=_user("Q4"), turn=4, step=0)
+    assert session.events[-1].seq == before_max + 1
+
+    # 二次压缩稳定：内存窗口化 + 磁盘全量不丢
+    asyncio.run(compactor.compact())
+    restored2 = Session.from_file(session.session_id, persist_dir=str(tmp_path))
+    assert sorted(e.seq for e in restored2.events) == list(
+        range(len(restored2.events))
+    )
+    assert len(restored2.events) >= compact_total
+    assert restored2.derive_messages() == session.derive_messages()

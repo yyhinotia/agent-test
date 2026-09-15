@@ -69,6 +69,7 @@ class Session:
         self.persist_dir.mkdir(parents=True, exist_ok=True)
         self.file_path.touch(exist_ok=True)  # 自动创建持久化文件
         self.events: List[SessionEvent] = []
+        self._archived: List[SessionEvent] = []  # 已压缩事件归档副本（内存窗口化后仍保有全量）
         self._seq: int = 0  # 持久化游标：下一条事件的 seq
 
     # ---------- 事件追加 ----------
@@ -336,17 +337,46 @@ class Session:
         self._persist_all()
         return self.events[index + 1]
 
+    def cut_to_context_window(self) -> None:
+        """压缩后调用：内存 events 只保留上下文窗口（可进上下文的非压缩事件）。
+
+        被压缩（compacted=True）的旧事件从内存移除并转入 _archived 归档；
+        磁盘全量历史由压缩流程中的 _persist_all 保证，本方法只裁剪内存、
+        不触发落盘，避免用窗口覆盖磁盘全量。后续 append 仍按全局 _seq
+        游标追加并写盘，磁盘始终是全量 0..N-1 连续序列。
+        """
+        new_archived = [e for e in self.events if e.compacted]
+        self._archived = sorted(
+            self._archived + new_archived, key=lambda e: e.seq
+        )
+        self.events = [e for e in self.events if not e.compacted]
+
     def _renumber(self) -> None:
-        """把全部事件 seq 重排为 0..N-1，并同步追加游标。"""
-        for i, event in enumerate(self.events):
+        """把全部事件（含归档副本）seq 重排为 0..N-1，并同步追加游标。
+
+        内存窗口化后，全量 = _archived（历史归档）+ events（上下文窗口），
+        重排必须作用于全量，否则磁盘 seq 会与窗口裁剪产生缺口。
+        """
+        all_events = self._archived + self.events
+        for i, event in enumerate(all_events):
             if event.seq != i:
-                self.events[i] = event.model_copy(update={"seq": i})
-        self._seq = len(self.events)
+                all_events[i] = event.model_copy(update={"seq": i})
+        n_archived = len(self._archived)
+        self._archived = all_events[:n_archived]
+        self.events = all_events[n_archived:]
+        self._seq = len(all_events)
 
     def _persist_all(self) -> None:
-        """全量重写 JSONL，使磁盘与内存一致（压缩打标 / 插入摘要后调用）。"""
+        """全量重写 JSONL：归档副本 + 上下文窗口，磁盘始终是全量历史。
+
+        压缩打标 / 插入摘要 / 窗口化后调用，保证磁盘与内存全量一致
+        （内存只保留上下文窗口，归档部分存于 _archived）。
+        """
+        all_events = sorted(self._archived + self.events, key=lambda e: e.seq)
         try:
-            text = "".join(event.model_dump_json() + "\n" for event in self.events)
+            text = "".join(
+                event.model_dump_json() + "\n" for event in all_events
+            )
             with self.file_path.open("w", encoding="utf-8", newline="\n") as f:
                 f.write(text)
         except OSError as exc:

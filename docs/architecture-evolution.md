@@ -764,3 +764,11 @@ suspend/confirm、LangGraph interrupt、Codex allow-and-remember，来源与对�
    （4 例，含上述 10000 端到端）；全量 113 例——107 passed；其余 6 例
    （bash 工具子进程类）在本执行环境因创建 cmd 子进程被拒（WinError 5）失败，
    经基线 HEAD（6e2baf0）临时工作树复跑验证为既有环境问题，非本次回归。
+9. **内存窗口化（追加优化）**：压缩成功后调用 `Session.cut_to_context_window()`
+   ——被压缩（compacted=True）的旧事件从内存 events 移除并转入 `_archived`
+   归档，内存只保存上下文窗口（compact 摘要 + 最近保留事件），`events`
+   即"上下文窗口"；磁盘 JSONL 始终是全量 0..N-1 历史——压缩流程的
+   `_persist_all` 先全量落盘、窗口化只裁剪内存不覆盖磁盘，且 `_persist_all` /
+   `_renumber` 均纳入归档副本，保证磁盘 seq 全局连续；from_file 仍恢复全量
+   可审计。新增 `test_compactor_memory_window_keeps_disk_full` 覆盖窗口化 /
+   磁盘全量 / append 连续性 / 二次压缩稳定 / roundtrip 一致。

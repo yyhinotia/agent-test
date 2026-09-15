@@ -210,4 +210,7 @@ class Compactor:
             turn=last_compacted.turn,
             step=0,
         )
+        # 内存窗口化：被压缩旧事件从 events 移入归档（磁盘全量已由
+        # insert_after 的 _persist_all 落盘）；events 只作为上下文窗口。
+        self.session.cut_to_context_window()
         return summary

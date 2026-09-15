@@ -315,6 +315,10 @@ restored = Session.from_file(agent.session.session_id)
   降级二级全量压缩；摘要生成优先级为注入 summarize > LLM 客户端 > 保守截断；
 - `derive_messages()` 跳过 compacted 事件、把摘要包装为 UserMessage 重入上下文；
   压缩后事件全量重写 JSONL，seq 连续可回放；
+- 内存窗口化：压缩成功后 `Session.cut_to_context_window()` 把被压缩的旧事件
+  从内存 events 移除（转入 _archived 归档），events 只作为上下文窗口
+  （compact 摘要 + 最近保留事件）；磁盘 JSONL 始终是全量历史（seq 0..N-1
+  连续，from_file 可完整恢复），窗口化后继续 append 的 seq 仍全局连续；
 - 小窗口验证：`ReactAgent(max_context_tokens=10000)` 端到端测试
   （tests/test_compact.py::test_agent_context_window_10000_compacts_normally）
   验证 10000 窗口下压缩**正常且准确**——旧回合被摘要替代、最近一轮完整保留、
