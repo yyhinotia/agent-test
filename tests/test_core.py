@@ -214,11 +214,13 @@ def test_react_agent_loop_with_fake_llm(monkeypatch, tmp_path):
                         ],
                     ),
                     "",
+                    None,
                 )
             # 第二轮: 给出最终回答
             return (
                 AssistantMessage(id="a2", content=[TextBlock(content="结果是 3")]),
                 "finish",
+                None,
             )
 
     agent = ReactAgent(persist_dir=str(tmp_path))

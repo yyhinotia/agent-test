@@ -156,10 +156,12 @@ class _AskFakeLLM:
                     ],
                 ),
                 "",
+                None,
             )
         return (
             AssistantMessage(id="a2", content=[TextBlock(content="好，用 PostgreSQL")]),
             "finish",
+            None,
         )
 
 

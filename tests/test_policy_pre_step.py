@@ -177,10 +177,12 @@ class _FakeLLM:
                     ],
                 ),
                 "",
+                None,
             )
         return (
             AssistantMessage(id="a2", content=[TextBlock(content="done")]),
             "finish",
+            None,
         )
 
 

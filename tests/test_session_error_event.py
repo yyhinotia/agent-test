@@ -86,6 +86,7 @@ def test_agent_records_message_edit_error_event(tmp_path):
                     content=[ToolCallBlock(id="c1", name="read", args="{bad-json")],
                 ),
                 "",
+                None,
             )
 
     agent = ReactAgent(persist_dir=str(tmp_path / "sessions"))

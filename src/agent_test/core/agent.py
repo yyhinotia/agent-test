@@ -1,11 +1,14 @@
-"""ReAct Agent 核心：回合循环、步骤执行与错误统一处理。
+"""ReAct Agent 核心：回合循环、步骤执行与统一错误处理。
 
-重构要点
---------
-- 依赖注入：llm_client / tools / inbox / session 均可由外部传入
-  （默认仍使用全局 LLM_CLIENT 注册表与 tool_center 单例），便于测试与复用；
-- 产出即持久化：step 产生的 LLM 消息与工具结果**立即**写入 session，
-  消除旧实现“先入 inbox.step 再兜底补记”导致的最终回答丢失窗口；
+知识增量（2026-09-09 知识包）
+------------------------------
+- 消息流：LLM 返回/工具结果不再直接 session.append，而是先入
+  inbox.step，由下一步 pre_step claim 写入 session；回合收尾时
+  刷空残留 step 消息，保证最终答复不丢失；
+- 上下文管理：TokenMeter 按 LLM usage 做阈值检测，超过阈值由
+  Compactor 两级压缩（历史 turn 摘要化为 compact/summary 事件）；
+- 事件溯源：所有 session.append 携带 turn/step 上下文，Compactor
+  按 turn 分块并排除近期；
 - 错误统一处理：任何运行时异常 -> 完整堆栈写入日志文件（RuntimeLog），
   location + error_type + message 摘要写入 session（runtime/error 事件），
   二者通过 session_id 关联，方便回放与排查。
@@ -13,7 +16,9 @@
 from __future__ import annotations
 
 from agent_test.core.inbox import InBox
+from agent_test.llm.compactor import Compactor
 from agent_test.llm.registry import LLM_CLIENT
+from agent_test.llm.token_meter import TokenMeter
 from agent_test.log.runtime_log import RuntimeLog
 from agent_test.policy import PolicyAction, PolicyDecision
 from agent_test.session.session import Session
@@ -52,6 +57,10 @@ class ReactAgent:
         tools=None,
         inbox: InBox | None = None,
         session: Session | None = None,
+        max_context_tokens: int = 128000,
+        threshold_ratio: float = 0.8,
+        token_meter: TokenMeter | None = None,
+        compactor: Compactor | None = None,
     ):
         """初始化 Agent。
 
@@ -59,6 +68,8 @@ class ReactAgent:
         - llm_client: LLM_CLIENT["openai"]（懒构建，需要 API_KEY 等环境变量）
         - tools:      全局 tool_center 单例（含内置 read/find/grep/edit/list/write 与 bash 命令执行工具）
         - inbox / session: 新建本 Agent 私有实例
+        - token_meter / compactor: 按 max_context_tokens / threshold_ratio 新建
+          （知识增量；测试可用 max_context_tokens=10000 验证小窗口压缩）
         """
         self.tool_center = tools if tools is not None else tool_center
         self.llm_client = (
@@ -71,6 +82,19 @@ class ReactAgent:
             else Session(session_id=session_id, persist_dir=persist_dir)
         )
         self.phase = Phase()
+        self.token_meter = (
+            token_meter
+            if token_meter is not None
+            else TokenMeter(
+                max_context_tokens=max_context_tokens,
+                threshold_ratio=threshold_ratio,
+            )
+        )
+        self.compactor = (
+            compactor
+            if compactor is not None
+            else Compactor(session=self.session, llm_client=self.llm_client)
+        )
         # 让 LLM 适配器能感知当前 session（用于错误事实记录）
         if hasattr(self.llm_client, "session"):
             self.llm_client.session = self.session
@@ -87,8 +111,9 @@ class ReactAgent:
             session_id=self.session.session_id, turn=self.phase.turn
         )
         try:
+            turn_no = self.phase.turn
             self.session.append(
-                EventType.TURN_START, data={"turn": self.phase.turn}
+                EventType.TURN_START, data={"turn": turn_no}, turn=turn_no
             )
 
             # 1. 取出并持久化本轮用户/回合消息
@@ -96,18 +121,24 @@ class ReactAgent:
             if not queued:
                 return False
             for message in queued:
-                self.session.append(_event_type_for(message), data=message)
+                self.session.append(
+                    _event_type_for(message), data=message, turn=turn_no
+                )
 
-            # 2. 循环执行 step：从 session 组装 LLM 历史，
-            #    直到模型给出最终回答（finish / max_token）或出错
+            # 2. 循环执行 step：LLM 输出与工具结果先进 inbox.step，
+            #    由下一步 pre_step claim 写 session；直到模型给出最终
+            #    回答（finish / max_token）或出错
             while True:
                 end_reason = await self._step()
                 if end_reason in ("max_token", "finish", "error"):
                     break
                 self.phase.stage = "step"
 
+            # 3. 收尾：刷空残留在 inbox.step 的最终答复/工具结果
+            self._flush_step_messages()
+
             self.session.append(
-                EventType.TURN_END, data={"turn": self.phase.turn}
+                EventType.TURN_END, data={"turn": turn_no}, turn=turn_no
             )
             return True
         except Exception:
@@ -122,31 +153,48 @@ class ReactAgent:
             RuntimeLog.unbind(tokens)
 
     async def _step(self) -> str:
-        """执行一步：从 session 组装 LLM 输入，调用 LLM 并执行工具。
+        """执行一步：claim step 消息 -> 组装上下文 -> 调用 LLM -> 执行工具。
 
         返回 end_reason：''（需要继续工具循环）/ finish / max_token / error。
         """
         self.phase.step += 1
         step_idx = self.phase.step
-        self.session.append(EventType.STEP_START, data={"step_idx": step_idx})
+        self.session.append(
+            EventType.STEP_START,
+            data={"step_idx": step_idx},
+            turn=self.phase.turn,
+            step=step_idx,
+        )
         try:
+            # ① pre_step claim：把上一步产出的 step 消息写入 session
+            self._flush_step_messages()
+
+            # ② 组装当前上下文并调用 LLM（三元组：消息 / 结束原因 / usage）
             all_messages = self.session.derive_messages()
-            assistant_message, end_reason = await self.llm_client.stream(
+            assistant_message, end_reason, usage = await self.llm_client.stream(
                 all_messages, self.tool_center.get_schemas()
             )
 
-            # 产出即持久化：LLM 消息立即写入 session
-            if assistant_message is not None:
-                self.session.append(
-                    _event_type_for(assistant_message), data=assistant_message
-                )
+            # ③ TokenMeter 阈值检测：超阈值 -> Compactor 两级压缩 -> 复位
+            self.token_meter.update(usage)
+            if self.token_meter.is_over_threshold():
+                await self._compact_context()
+                self.token_meter.reset()
 
-            # 执行模型请求的工具，结果立即写入 session
-            tool_calls = [
-                block
-                for block in assistant_message.content
-                if isinstance(block, ToolCallBlock)
-            ]
+            # ④ 本步 LLM 产出先进 inbox.step（下步 claim 或回合收尾落 session）
+            if assistant_message is not None:
+                self.inbox.append("step", assistant_message)
+
+            # 执行模型请求的工具，结果同样先进 inbox.step
+            tool_calls = (
+                [
+                    block
+                    for block in assistant_message.content
+                    if isinstance(block, ToolCallBlock)
+                ]
+                if assistant_message is not None
+                else []
+            )
             # pre_step：整步工具调用先做一次“全量预检”。硬拒绝（DENY）
             # 在副作用前拦截；REQUIRE_APPROVAL 在未配置 approver 时也
             # 在此拦截，配置了 approver 则交由 ToolCenter 闸门交互审批
@@ -178,11 +226,14 @@ class ReactAgent:
                     content=[TextBlock(content=result["content"])],
                     is_error=result["is_error"],
                 )
-                self.session.append(
-                    _event_type_for(tool_result), data=tool_result
-                )
+                self.inbox.append("step", tool_result)
 
-            self.session.append(EventType.STEP_END, data={"step_idx": step_idx})
+            self.session.append(
+                EventType.STEP_END,
+                data={"step_idx": step_idx},
+                turn=self.phase.turn,
+                step=step_idx,
+            )
             return end_reason
         except Exception as exc:
             # 错误统一处理：堆栈进日志文件，事实进 session
@@ -197,6 +248,8 @@ class ReactAgent:
                     error_type=summary["error_type"],
                     message=summary["message"],
                     detail={"turn": self.phase.turn, "step": step_idx},
+                    turn=self.phase.turn,
+                    step=step_idx,
                 )
             except Exception:  # noqa: BLE001
                 # session 本身不可写时不再追加，避免掩盖原始错误
@@ -205,6 +258,25 @@ class ReactAgent:
                     self.session.file_path,
                 )
             return "error"
+
+    def _flush_step_messages(self) -> None:
+        """把 inbox.step 中待写消息落 session（pre_step claim / 回合收尾）。"""
+        if not self.inbox.has_step_pending():
+            return
+        for message in self.inbox.claim("step"):
+            self.session.append(
+                _event_type_for(message),
+                data=message,
+                turn=self.phase.turn,
+                step=self.phase.step,
+            )
+
+    async def _compact_context(self) -> int:
+        """上下文压缩：一级保留最近一轮；无可压缩块时降级二级全量压缩。"""
+        count = await self.compactor.compact()
+        if count == 0:
+            count = await self.compactor.compact(recent_turns=0)
+        return count
 
     def _pre_step(
         self, tool_calls: list[ToolCallBlock]

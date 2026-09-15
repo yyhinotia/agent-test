@@ -1,14 +1,21 @@
 """会话与执行事件记录（含错误事件与持久化游标）。
 
-设计要点（重构后）
-------------------
+设计要点（重构后 + 知识增量）
+------------------------------
 - **持久化游标**：append 的 seq 使用自维护的 `_seq` 游标，不再依赖
   `len(self.events)`，保证 from_file 恢复后继续追加的事件序号连续；
 - **错误事件**：`append_error` 只记录错误“事实” —— 执行位置 + 报错类型
   + 消息摘要（runtime/error 事件），完整堆栈由 RuntimeLog 写入日志文件，
   二者通过 session_id 关联，既满足回放需求又不污染会话正文；
-- **连续性校验**：from_file 恢复时校验事件 seq 是否连续，发现问题记
-  告警日志；strict=True 时抛出 SessionContinuityError。
+- **连续性校验**：from_file 恢复时按「seq 集合校验」`sorted(seqs) == range(N)`
+  检查事件序号是否恰好为 0..N-1（知识增量）；
+- **事件唯一事实源**：事件携带 turn/step/compacted 元数据（知识增量）：
+  - Compactor 按 turn 分块，把历史回合摘要化为 compact/summary 事件；
+  - derive_messages 跳过 compacted=True 事件，并把 COMPACT 事件的
+    data(str) 包装为 UserMessage 重新进入上下文；
+  - mark_compacted / insert_after / _persist_all 支持“追加 + 全量重写”：
+    压缩时对旧事件打标、插入摘要事件并全量重写 JSONL，保证磁盘与
+    内存一致。
 """
 from __future__ import annotations
 
@@ -22,6 +29,7 @@ from agent_test.types.events import EventType, SessionEvent
 from agent_test.types.messages import (
     AssistantMessage,
     Message,
+    TextBlock,
     ToolResultMessage,
     UserMessage,
 )
@@ -65,13 +73,9 @@ class Session:
 
     # ---------- 事件追加 ----------
 
-    def append(
-        self, event_type: str | EventType, data: Any = None
-    ) -> SessionEvent:
-        """追加一条执行事件并同步持久化（一行一条 JSON）。
-
-        事件类型不合法时抛出 SessionEditError；返回写入的事件对象。
-        """
+    @staticmethod
+    def _validate_type(event_type: str | EventType) -> str:
+        """校验并规范化事件类型字符串；非法时抛出 SessionEditError。"""
         if isinstance(event_type, EventType):
             type_value: str = event_type.value
         else:
@@ -90,12 +94,32 @@ class Session:
                 location="Session.append",
                 detail={"event_type": repr(event_type)},
             ) from exc
+        return type_value
+
+    def append(
+        self,
+        event_type: str | EventType,
+        data: Any = None,
+        *,
+        turn: int = 0,
+        step: int = 0,
+    ) -> SessionEvent:
+        """追加一条执行事件并同步持久化（一行一条 JSON）。
+
+        知识增量：追加时可通过 turn / step 标注事件所属回合与步骤，
+        Compactor 按 turn 分块、按 step 排除近期。
+
+        事件类型不合法时抛出 SessionEditError；返回写入的事件对象。
+        """
+        type_value = self._validate_type(event_type)
 
         event = SessionEvent(
             seq=self._seq,
             type=type_value,
             data=data,
             time=get_now(),
+            turn=turn,
+            step=step,
         )
         self.events.append(event)
         self._seq += 1
@@ -126,6 +150,8 @@ class Session:
         message: str,
         *,
         detail: Dict[str, Any] | None = None,
+        turn: int = 0,
+        step: int = 0,
     ) -> SessionEvent:
         """记录一次运行时错误（事实进 session，堆栈进日志文件）。
 
@@ -141,15 +167,35 @@ class Session:
                 "message": message,
                 "detail": detail or {},
             },
+            turn=turn,
+            step=step,
         )
 
     # ---------- 读取 / 恢复 ----------
 
     def derive_messages(self) -> List[Message]:
-        """从事件中提取完整的 LLM 历史消息列表。"""
-        return [
-            event.data for event in self.events if isinstance(event.data, Message)
-        ]
+        """从事件中提取完整的 LLM 历史消息列表。
+
+        知识增量：
+        - 跳过 compacted=True 的旧事件（已被摘要替代）；
+        - COMPACT 事件的 data(str) 摘要包装为 UserMessage 重新进入上下文。
+        """
+        messages: List[Message] = []
+        for event in self.events:
+            if event.compacted:
+                continue
+            data = event.data
+            if event.type == EventType.COMPACT.value and isinstance(data, str):
+                messages.append(
+                    UserMessage(
+                        id=f"compact-{event.seq}",
+                        content=[TextBlock(content=data)],
+                    )
+                )
+                continue
+            if isinstance(data, Message):
+                messages.append(data)
+        return messages
 
     @classmethod
     def from_file(
@@ -161,8 +207,9 @@ class Session:
     ) -> "Session":
         """从持久化文件恢复会话（消息自动还原为 Message 模型）。
 
-        strict=False（默认）：事件序号不连续时仅记告警日志；
-        strict=True：序号不连续直接抛 SessionContinuityError。
+        知识增量：恢复完成后做「seq 集合校验」`sorted(seqs) == range(N)`。
+        strict=False（默认）：seq 集合不连续时仅记告警日志；
+        strict=True：不连续直接抛 SessionContinuityError。
         """
         session = cls(session_id=session_id, persist_dir=persist_dir)
         session.events.clear()
@@ -197,18 +244,7 @@ class Session:
                                 "line_no": line_no,
                             },
                         ) from exc
-                    if event.seq != session._seq:
-                        msg = (
-                            f"会话 {session_id} 事件序号不连续: "
-                            f"期望 {session._seq}, 实际 {event.seq}"
-                        )
-                        if strict:
-                            raise SessionContinuityError(
-                                msg, location="Session.from_file"
-                            )
-                        RuntimeLog.warning(msg)
                     session.events.append(event)
-                    session._seq = max(session._seq, event.seq + 1)
         except OSError as exc:
             # 文件打开/读取阶段失败（文件缺失、权限、IO 等）
             RuntimeLog.capture_exception(
@@ -224,4 +260,102 @@ class Session:
                 location="Session.from_file",
                 detail={"session_id": session_id},
             ) from exc
+
+        # seq 集合校验: sorted(seqs) == range(N)
+        session._seq = len(session.events)
+        seqs = [event.seq for event in session.events]
+        if seqs and sorted(seqs) != list(range(len(seqs))):
+            msg = (
+                f"会话 {session_id} 事件 seq 集合不连续: "
+                f"{sorted(seqs)} != {list(range(len(seqs)))}"
+            )
+            if strict:
+                raise SessionContinuityError(msg, location="Session.from_file")
+            RuntimeLog.warning(msg)
         return session
+
+    # ---------- 压缩 / 改写（知识增量） ----------
+
+    def mark_compacted(self, seq_start: int, seq_end: int) -> int:
+        """把 [seq_start, seq_end) 区间事件标记为 compacted 并全量重写。
+
+        返回区间内最后一个事件的列表索引（供 insert_after 使用）。
+        """
+        if seq_start < 0 or seq_end <= seq_start:
+            raise SessionEditError(
+                "mark_compacted 区间非法",
+                location="Session.mark_compacted",
+                detail={"seq_start": seq_start, "seq_end": seq_end},
+            )
+        last_index = -1
+        for i, event in enumerate(self.events):
+            if seq_start <= event.seq < seq_end:
+                if not event.compacted:
+                    self.events[i] = event.model_copy(update={"compacted": True})
+                last_index = i
+        if last_index < 0:
+            raise SessionEditError(
+                "mark_compacted 区间内没有事件",
+                location="Session.mark_compacted",
+                detail={"seq_start": seq_start, "seq_end": seq_end},
+            )
+        self._persist_all()
+        return last_index
+
+    def insert_after(
+        self,
+        index: int,
+        event_type: str | EventType,
+        data: Any,
+        *,
+        turn: int = 0,
+        step: int = 0,
+    ) -> SessionEvent:
+        """在 index 后插入一条事件（compact/summary 用）并全量重写。
+
+        插入后对所有事件重新编号（seq = 0..N-1），保持磁盘 seq 集合
+        连续（from_file 的 sorted(seqs) == range(N) 校验依赖此不变式）。
+        """
+        if not (0 <= index < len(self.events)):
+            raise SessionEditError(
+                "insert_after 索引越界",
+                location="Session.insert_after",
+                detail={"index": index, "len": len(self.events)},
+            )
+        type_value = self._validate_type(event_type)
+        event = SessionEvent(
+            seq=len(self.events) + 1,  # 插入后统一重新编号
+            type=type_value,
+            data=data,
+            time=get_now(),
+            turn=turn,
+            step=step,
+        )
+        self.events.insert(index + 1, event)
+        self._renumber()
+        self._persist_all()
+        return self.events[index + 1]
+
+    def _renumber(self) -> None:
+        """把全部事件 seq 重排为 0..N-1，并同步追加游标。"""
+        for i, event in enumerate(self.events):
+            if event.seq != i:
+                self.events[i] = event.model_copy(update={"seq": i})
+        self._seq = len(self.events)
+
+    def _persist_all(self) -> None:
+        """全量重写 JSONL，使磁盘与内存一致（压缩打标 / 插入摘要后调用）。"""
+        try:
+            text = "".join(event.model_dump_json() + "\n" for event in self.events)
+            with self.file_path.open("w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+        except OSError as exc:
+            RuntimeLog.capture_exception(
+                exc,
+                location="Session._persist_all",
+                detail={"file_path": str(self.file_path)},
+            )
+            raise SessionEditError(
+                f"事件全量重写失败: {self.file_path}",
+                location="Session._persist_all",
+            ) from exc
