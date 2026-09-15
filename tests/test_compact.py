@@ -1,14 +1,20 @@
-"""Compactor / TokenMeter 集成测试：上下文窗口 10000 下的正常、准确压缩。"""
+"""Compactor / TokenMeter 集成测试：上下文窗口 10000 下的正常、准确压缩。
+
+按知识包（docs/knowledge.txt）验收：
+- 单 turn 多 step 场景按 step 粒度排除最近 remain_turns 个 step（非按 turn）；
+- compact_session 输出 "[turn=N step=S] Role: content"，ToolResult 超窗口裁剪；
+- 两级压缩：一级保留近期 step，无可压缩块时降级二级全量；
+- 端到端：max_context_tokens=10000、阈值 0.8 时 usage 超 8000 触发压缩，
+  压缩正常且准确（旧回合被摘要替代、最近回合保留、roundtrip seq 连续）。
+"""
 import asyncio
 
 from agent_test import ReactAgent
 from agent_test.llm.compactor import Compactor
-from agent_test.llm.token_meter import TokenMeter
 from agent_test.session.session import Session
 from agent_test.types.events import EventType
 from agent_test.types.messages import (
     AssistantMessage,
-    Message,
     TextBlock,
     ToolResultMessage,
     UserMessage,
@@ -24,73 +30,159 @@ def _assistant(text: str) -> AssistantMessage:
     return AssistantMessage(id=get_uuid(), content=[TextBlock(content=text)])
 
 
-# ---------- Compactor 单元：按 turn 分块 / 排除近期 / 摘要准确 ----------
+def _tool(text: str, *, is_error: bool = False) -> ToolResultMessage:
+    return ToolResultMessage(
+        tool_call_id="tc-1",
+        content=[TextBlock(content=text)],
+        is_error=is_error,
+    )
 
 
-def test_compactor_compacts_old_turns_keeps_recent(tmp_path):
-    """plan_blocks 按 turn 分块并排除最近一轮；compact 只压缩历史回合。"""
+# ---------- 单元：按 (turn,step) 排除近期（step 粒度，非 turn） ----------
+
+
+def test_compactor_single_turn_multi_step_keeps_recent_steps(tmp_path):
+    """单 turn 多 step：排除最近 remain_turns 个 step，压缩更早的 step。
+
+    知识包验收标准：单 turn 多 step 场景压缩正确排除最近 N 个 step
+    （非按 turn 排除——若按 turn 会把整个 turn 保留、一个都压不掉）。
+    """
     session = Session(persist_dir=str(tmp_path))
-    for turn, texts in ((1, ("a", "b")), (2, ("c", "d")), (3, ("e", "f"))):
-        for idx, text in enumerate(texts):
-            session.append("user/message", data=_user(text), turn=turn, step=idx + 1)
-            session.append(
-                "assistant/message", data=_assistant(text), turn=turn, step=idx + 1
-            )
+    session.append("user/message", data=_user("问题"), turn=1, step=0)
+    # 同一 turn 内 5 次 LLM 调用（step 全局递增 1..5）
+    for step in range(1, 6):
+        session.append(
+            "assistant/message",
+            data=_assistant(f"回复{step}"),
+            turn=1,
+            step=step,
+        )
+        session.append(
+            "tool/result", data=_tool(f"结果{step}"), turn=1, step=step
+        )
+
+    compactor = Compactor(session=session, summarize=lambda text: "SUM")
+    summary = asyncio.run(compactor.compact())  # remain_turns 默认 2
+
+    assert summary == "SUM"
+    events = session.events
+    summaries = [e for e in events if e.type == EventType.COMPACT.value]
+    assert len(summaries) == 1
+
+    # 最近 2 个 step（4、5）保留，更早的 step（0..3，含用户消息）被压缩
+    compacted = [e for e in events if e.compacted]
+    assert len(compacted) == 7  # 用户消息 + step1..3 的 assistant/tool 各 2 条
+    assert all(e.step <= 3 for e in compacted)
+
+    msgs = session.derive_messages()
+    assert any(
+        isinstance(m, UserMessage) and m.content[0].content == "SUM"
+        for m in msgs
+    )
+    assert any(
+        isinstance(m, AssistantMessage) and m.content[0].content == "回复4"
+        for m in msgs
+    )
+    assert any(
+        isinstance(m, AssistantMessage) and m.content[0].content == "回复5"
+        for m in msgs
+    )
+    assert not any(
+        isinstance(m, AssistantMessage) and m.content[0].content == "回复1"
+        for m in msgs
+    )
+
+    # 持久化 roundtrip：seq 集合连续、消息一致
+    restored = Session.from_file(session.session_id, persist_dir=str(tmp_path))
+    assert sorted(e.seq for e in restored.events) == list(
+        range(len(restored.events))
+    )
+    assert restored.derive_messages() == session.derive_messages()
+
+
+def test_compactor_multi_turn_keeps_recent_steps(tmp_path):
+    """多 turn：全局 (turn,step) 排序，保留最近 remain_turns 个 step。"""
+    session = Session(persist_dir=str(tmp_path))
+    # turn1: step1-2；turn2: step3-4；turn3: step5-6（step 全局递增）
+    for turn, (s1, s2) in ((1, (1, 2)), (2, (3, 4)), (3, (5, 6))):
+        session.append(
+            "user/message", data=_user(f"Q{turn}"), turn=turn, step=0
+        )
+        session.append(
+            "assistant/message",
+            data=_assistant(f"A{turn}-{s1}"),
+            turn=turn,
+            step=s1,
+        )
+        session.append(
+            "assistant/message",
+            data=_assistant(f"A{turn}-{s2}"),
+            turn=turn,
+            step=s2,
+        )
 
     compactor = Compactor(
         session=session, summarize=lambda text: f"SUM({len(text)})"
     )
-    blocks = compactor.plan_blocks(recent_turns=1)
-    assert [b[2] for b in blocks] == [1, 2]  # turn3（最近一轮）保留
+    summary = asyncio.run(compactor.compact())
 
-    count = asyncio.run(compactor.compact())
-    assert count == 2  # turn1 + turn2 各压成一条摘要
-
-    events = session.events
-    assert sum(1 for e in events if e.compacted) == 8  # turn1+2 的 8 条消息事件
-    summaries = [e for e in events if e.type == EventType.COMPACT.value]
-    assert len(summaries) == 2
-    assert {e.turn for e in summaries} == {1, 2}
-
-    # 摘要 data 与注入的 summarize 输出一致（准确性）
-    for e in summaries:
-        assert e.data.startswith("SUM(")  # 摘要来自注入的 summarize（重编号后不回溯原文本）
-
-    # derive_messages：跳过 compacted 事件；摘要包装为 UserMessage；最近回合完整保留
+    assert summary is not None and summary.startswith("SUM(")
     msgs = session.derive_messages()
-    assert len(msgs) == 6  # turn3 的 4 条消息 + 2 条摘要
-    assert sum(1 for m in msgs if isinstance(m, UserMessage)) == 4  # 2 摘要 + turn3 的 2 条用户消息
-    assert sum(
-        1
-        for m in msgs
-        if isinstance(m, UserMessage) and m.content[0].content.startswith("SUM(")
-    ) == 2
+    # 最近 2 个 step（5、6，均在 turn3）完整保留
     assert any(
-        isinstance(m, UserMessage) and m.content[0].content == "e" for m in msgs
+        isinstance(m, AssistantMessage) and m.content[0].content == "A3-5"
+        for m in msgs
     )
     assert any(
-        isinstance(m, AssistantMessage) and m.content[0].content == "f" for m in msgs
+        isinstance(m, AssistantMessage) and m.content[0].content == "A3-6"
+        for m in msgs
+    )
+    # turn1/turn2 全部被压缩吸收
+    assert not any(
+        isinstance(m, AssistantMessage) and m.content[0].content.startswith("A1")
+        for m in msgs
+    )
+    assert not any(
+        isinstance(m, AssistantMessage) and m.content[0].content.startswith("A2")
+        for m in msgs
     )
 
-    # 持久化 roundtrip：seq 集合连续、事件与消息一致
-    restored = Session.from_file(session.session_id, persist_dir=str(tmp_path))
-    seqs = [e.seq for e in restored.events]
-    assert sorted(seqs) == list(range(len(seqs)))
-    assert restored.events == session.events
-    assert restored.derive_messages() == session.derive_messages()
+
+def test_compact_session_clips_tool_result_and_formats_lines(tmp_path):
+    """compact_session 输出 [turn=N step=S] Role: content；ToolResult 裁剪。"""
+    session = Session(persist_dir=str(tmp_path))
+    session.append("user/message", data=_user("你好"), turn=1, step=0)
+    session.append("assistant/message", data=_assistant("回复"), turn=1, step=1)
+    session.append(
+        "tool/result", data=_tool("x" * 3000, is_error=True), turn=1, step=1
+    )
+
+    compactor = Compactor(session=session, tool_head=5, tool_tail=5)
+    lines = compactor.compact_session(session.events)
+
+    assert lines[0] == "[turn=1 step=0] user: 你好"
+    assert lines[1] == "[turn=1 step=1] assistant: 回复"
+    t = lines[2]
+    assert t.startswith("[turn=1 step=1] tool:tc-1:error: xxxxx")
+    assert "省略" in t
+    assert t.endswith("xxxxx")
+    assert len(lines) == 3
+
+
+# ---------- 单元：两级压缩降级 ----------
 
 
 def test_compactor_fallback_second_level_compacts_all(tmp_path):
-    """一级无可压缩块时（只有一轮），compact 降级二级全量压缩。"""
+    """一级无可压缩块时（只有 1 个 step），compact 降级二级全量压缩。"""
     session = Session(persist_dir=str(tmp_path))
-    session.append("user/message", data=_user("x"), turn=1, step=1)
+    session.append("user/message", data=_user("x"), turn=1, step=0)
     session.append("assistant/message", data=_assistant("y"), turn=1, step=1)
 
     compactor = Compactor(session=session, summarize=lambda text: "SUMMARY")
-    assert compactor.plan_blocks(recent_turns=1) == []  # 只有一轮，一级无块
+    # 一级 remain_turns=2：2 个 (turn,step) 对 <= 2，无可压缩 → 二级全量
+    summary = asyncio.run(compactor.compact())
 
-    count = asyncio.run(compactor.compact())  # 自动降级二级
-    assert count == 1
+    assert summary == "SUMMARY"
     assert any(e.type == EventType.COMPACT.value for e in session.events)
     msgs = session.derive_messages()
     # 全量压成一条摘要 + 无残留原始消息
@@ -116,6 +208,9 @@ def test_session_mark_and_insert_renumber(tmp_path):
     assert seqs == list(range(len(session.events)))
 
     restored = Session.from_file(session.session_id, persist_dir=str(tmp_path))
+    assert sorted(e.seq for e in restored.events) == list(
+        range(len(restored.events))
+    )
     assert restored.events == session.events
 
 
@@ -128,7 +223,7 @@ def test_agent_context_window_10000_compacts_normally(tmp_path):
     验证「正常 + 准确」：
     - 压缩确实发生（存在 compacted 事件与 compact/summary 摘要事件）；
     - 被压缩的旧消息不再进入上下文，摘要以 UserMessage 进入；
-    - 最近一轮消息完整保留；
+    - 最近回合完整保留；
     - 持久化 roundtrip 后 seq 连续、derive_messages 一致。
     """
     calls = {"n": 0}
@@ -174,7 +269,8 @@ def test_agent_context_window_10000_compacts_normally(tmp_path):
     msgs = agent.session.derive_messages()
     # 最近回合（turn5）完整保留：用户问题与最终回答都在
     assert any(
-        isinstance(m, UserMessage) and m.content[0].content == "问题5" for m in msgs
+        isinstance(m, UserMessage) and m.content[0].content == "问题5"
+        for m in msgs
     )
     assert any(
         isinstance(m, AssistantMessage) and m.content[0].content == "回复5"
@@ -185,7 +281,7 @@ def test_agent_context_window_10000_compacts_normally(tmp_path):
         isinstance(m, UserMessage) and m.content[0].content.startswith("摘要:")
         for m in msgs
     )
-    # 被压缩的旧消息不再以原始内容出现在上下文（“问题1”应已被摘要吸收）
+    # 被压缩的旧消息不再以原始内容出现在上下文（"问题1" 应已被摘要吸收）
     assert not any(
         isinstance(m, UserMessage) and m.content[0].content.startswith("问题1")
         for m in msgs
@@ -198,3 +294,66 @@ def test_agent_context_window_10000_compacts_normally(tmp_path):
     seqs = [e.seq for e in restored.events]
     assert sorted(seqs) == list(range(len(seqs)))
     assert restored.derive_messages() == agent.session.derive_messages()
+
+# ---------- 单元：usage 降级（非流式兜底请求，知识包 3.4） ----------
+
+
+class _NS:
+    """极简命名空间：避免引入额外 import。"""
+
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+def _fallback_adapter(on_create):
+    """构造最小 OPENAIAdapter（绕过 __init__ 对 env 的依赖）。"""
+    from agent_test.llm.adapter import OPENAIAdapter
+
+    adapter = object.__new__(OPENAIAdapter)
+    adapter.model_name = "test-model"
+    adapter.client = _NS(chat=_NS(completions=_NS(create=on_create)))
+    return adapter
+
+
+def test_fetch_usage_fallback_sends_non_streaming_request():
+    """流式无 usage 时：降级发 stream=False / max_tokens=1 请求取准确 usage。"""
+    recorded = {}
+
+    async def fake_create(**kwargs):
+        recorded["kwargs"] = kwargs
+        return _NS(
+            usage=_NS(prompt_tokens=10, completion_tokens=5, total_tokens=15)
+        )
+
+    adapter = _fallback_adapter(fake_create)
+    tools = [{"type": "function", "function": {"name": "bash", "parameters": {}}}]
+    usage = asyncio.run(
+        adapter._fetch_usage_fallback([{"role": "user", "content": "hi"}], tools)
+    )
+
+    assert usage == {
+        "prompt_tokens": 10,
+        "completion_tokens": 5,
+        "total_tokens": 15,
+    }
+    kwargs = recorded["kwargs"]
+    assert kwargs["stream"] is False
+    assert kwargs["max_tokens"] == 1
+    assert kwargs["model"] == "test-model"
+    assert kwargs["tools"] == tools
+
+
+def test_fetch_usage_fallback_failure_returns_none():
+    """兜底请求抛异常或响应无 usage 时返回 None，不阻断主流程。"""
+
+    async def boom(**kwargs):
+        raise RuntimeError("network down")
+
+    adapter = _fallback_adapter(boom)
+    assert asyncio.run(adapter._fetch_usage_fallback([], None)) is None
+
+    async def no_usage(**kwargs):
+        return _NS(usage=None)
+
+    adapter2 = _fallback_adapter(no_usage)
+    assert asyncio.run(adapter2._fetch_usage_fallback([], None)) is None

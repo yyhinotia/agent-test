@@ -723,3 +723,44 @@ suspend/confirm、LangGraph interrupt、Codex allow-and-remember，来源与对�
    与决策 `default_cwd = allowed_roots[0]` 一致。
 6. **测试与图谱**：新增 tests/test_ask_user_tool.py（12 例，全量 104 passed）；
    graphify-out 重新生成。
+
+
+---
+
+## 2026-09-15：上下文压缩知识增量（TokenMeter / Compactor + turn/step/compacted）
+
+按 2026-09-09 增量知识包落地"上下文管理"，解决长对话上下文无限增长问题：
+
+1. **TokenMeter**（`agent_test/llm/token_meter.py`）：覆盖式记录 LLM usage
+   （total_tokens 是本次请求完整上下文大小，非增量），`is_over_threshold()`
+   在 total_tokens > threshold_tokens 时触发压缩，压缩后 `reset()`；
+   窗口与阈值均可配（测试用小窗口 10000 验证）。
+2. **Compactor**（`agent_test/llm/compactor.py`）：按 turn 分块、排除最近
+   `recent_turns` 个回合；两级压缩——一级保留最近一轮，无可压缩块时降级
+   二级全量压缩；摘要生成优先级：注入 summarize > llm_client.stream >
+   保守截断（_truncate），保证无 LLM 也不阻塞压缩。
+3. **事件模型**：SessionEvent 新增 `turn / step / compacted`（旧 JSONL 兼容
+   默认 0/false）；EventType 新增 `TOOL_CALL = "tool/call"`（agent 后续使用）
+   与 `COMPACT = "compact/summary"`（Compactor 摘要事件）。
+4. **Session 持久化**：新增 `mark_compacted(seq_start, seq_end) -> last_index`
+   （区间打标 + _persist_all）、`insert_after(index, type, data, *, turn, step)`
+   （插入摘要 + 全量重编号 + _persist_all）、`_persist_all()`（全量重写 JSONL）；
+   from_file 恢复校验升级为「seq 集合校验」`sorted(seqs) == range(N)`
+   （strict=False 仅告警）。
+5. **消息流调整**：LLM 返回与工具结果先入 `inbox.step`，由下一步 pre_step
+   claim 写入 session，回合收尾 `_flush_step_messages()` 兜底，保证最终答复
+   不丢失。
+6. **LLM Adapter**：`stream()` 返回三元组 `(AssistantMessage, str, Dict|None)`；
+   启用 `stream_options={"include_usage": True}`，末块提取 usage；服务端缺省时
+   `_fetch_usage_fallback` 按字符粗估兜底。
+7. **10000 窗口验证（本次目标）**：端到端用例
+   `test_agent_context_window_10000_compacts_normally`——注入 GrowingUsageLLM
+   （usage 逐轮递增 3500→9500），`max_context_tokens=10000` 阈值 8000，
+   第 5 次调用 total=9500 触发压缩；断言压缩确实发生、被压缩的旧回合不再
+   进入上下文、摘要（注入 summarize "摘要:" 前缀）作为 UserMessage 进入、
+   最近一轮（问题5/回复5）完整保留、持久化 roundtrip 后 seq 连续且
+   derive_messages 一致。
+8. **测试与统计**：新增 tests/test_token_meter.py（5 例）、tests/test_compact.py
+   （4 例，含上述 10000 端到端）；全量 113 例——107 passed；其余 6 例
+   （bash 工具子进程类）在本执行环境因创建 cmd 子进程被拒（WinError 5）失败，
+   经基线 HEAD（6e2baf0）临时工作树复跑验证为既有环境问题，非本次回归。

@@ -7,12 +7,12 @@
 知识增量：
 - stream() 返回三元组 (AssistantMessage, end_reason, usage)；
 - 调用时携带 stream_options={"include_usage": True} 请求用量，
-  服务端缺省时用 _fetch_usage_fallback 做字符粗估兜底；
+  服务端缺省时用 _fetch_usage_fallback 发非流式请求（max_tokens=1）
+  获取准确 usage，失败返回 None 不阻断主流程；
 - text delta 累积为单个 TextBlock（不再每个 delta 独立一条）。
 """
 from __future__ import annotations
 
-import json
 import os
 from typing import Any, Dict, List, Tuple
 
@@ -119,7 +119,7 @@ class OPENAIAdapter(LLMBaseAdapter):
         usage（知识增量）:
             {"prompt_tokens": int, "completion_tokens": int,
              "total_tokens": int} 或 None；服务端未返回时用
-            _fetch_usage_fallback 粗估兜底。
+            _fetch_usage_fallback 发非流式请求兜底，失败返回 None。
 
         重构后不再吞异常：调用失败抛出 LlmError（含原始异常链），完整
         堆栈由 ReactAgent 统一写入日志文件，调用位置在 session 记录
@@ -198,7 +198,7 @@ class OPENAIAdapter(LLMBaseAdapter):
                 assistant_message.content = [TextBlock(content="".join(content_parts))]
 
             if usage is None:
-                usage = self._fetch_usage_fallback(openai_message, tools)
+                usage = await self._fetch_usage_fallback(openai_message, tools)
 
         except Exception as exc:  # noqa: BLE001
             raise LlmError(
@@ -215,23 +215,30 @@ class OPENAIAdapter(LLMBaseAdapter):
                     pass
         return assistant_message, end_reason, usage
 
-    def _fetch_usage_fallback(
+    async def _fetch_usage_fallback(
         self, openai_message: List[Dict[str, Any]], tools: List[Dict] | None
-    ) -> Dict[str, Any]:
-        """服务端未返回 usage 时的估算兜底：按字符数粗估 token。
+    ) -> Dict[str, Any] | None:
+        """服务端未返回 usage 时的降级：非流式请求获取准确 usage。
 
-        以 prompt（对话历史 + 工具 schema）为主估算 total_tokens，
-        completion 按 prompt 的 1/4 粗估（流式输出典型比例）。真实计数
-        以服务端 usage 为准，此回退仅保证 TokenMeter 阈值判断可用。
+        知识包契约：usage=None 时发 stream=False、max_tokens=1 请求，
+        从响应 usage 提取 token 计数；请求失败返回 None，不阻断主流程
+        （TokenMeter 按无用量处理，等待下一轮真实 usage）。
         """
-        prompt_text = " ".join(
-            str(message.get("content", "")) for message in openai_message
-        )
-        tools_text = json.dumps(tools or [], ensure_ascii=False)
-        prompt_tokens = max(1, (len(prompt_text) + len(tools_text)) // 3)
-        completion_tokens = max(1, prompt_tokens // 4)
-        return {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens,
-        }
+        try:
+            resp = await self.client.chat.completions.create(
+                model=self.model_name,
+                messages=openai_message,
+                tools=tools or None,
+                stream=False,
+                max_tokens=1,
+            )
+            u = getattr(resp, "usage", None)
+            if u is None:
+                return None
+            return {
+                "prompt_tokens": getattr(u, "prompt_tokens", 0) or 0,
+                "completion_tokens": getattr(u, "completion_tokens", 0) or 0,
+                "total_tokens": getattr(u, "total_tokens", 0) or 0,
+            }
+        except Exception:  # noqa: BLE001
+            return None

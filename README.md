@@ -29,15 +29,17 @@ agent-test/
 │   │   └── runtime_log.py      #   RuntimeLog：懒配置 + session/turn/step 上下文
 │   ├── types/                  # 数据模型
 │   │   ├── messages.py         #   消息（User/Assistant/ToolResult + 内容块）
-│   │   ├── events.py           #   EventType/Phase/SessionEvent（事件唯一事实源）
+│   │   ├── events.py           #   EventType/Phase/SessionEvent（turn/step/compacted + COMPACT 摘要事件）
 │   │   └── tools.py            #   ToolSchema / ToolCenterSchema
 │   ├── core/                   # 核心执行
-│   │   ├── agent.py            #   ReactAgent（依赖注入 + 产出即持久化 + 错误统一处理）
+│   │   ├── agent.py            #   ReactAgent（依赖注入 + inbox.step 消息流 + TokenMeter/Compactor 压缩）
 │   │   └── inbox.py            #   InBox 消息队列（turn/step 分区，per-Agent 私有）
 │   ├── session/                # 会话
-│   │   └── session.py          #   Session（持久化游标 + append_error + from_file 校验）
+│   │   └── session.py          #   Session（持久化游标 + 压缩打标/摘要插入 + from_file 校验）
 │   ├── llm/                    # LLM 适配
-│   │   ├── adapter.py          #   LLMBaseAdapter / OPENAIAdapter（不再吞异常）
+│   │   ├── adapter.py          #   LLMBaseAdapter / OPENAIAdapter（stream 三元组 + usage）
+│   │   ├── token_meter.py      #   TokenMeter：按 LLM usage 阈值检测上下文占用
+│   │   ├── compactor.py        #   Compactor：按 turn 分块两级压缩（摘要化历史回合）
 │   │   └── registry.py         #   LLM_CLIENT 注册表（懒构建）
 │   ├── tools/                  # 工具
 │   │   ├── center.py           #   ToolCenter（注册/执行/策略闸门/approver，错误降级为结果）
@@ -61,6 +63,8 @@ agent-test/
 │   ├── test_session_error_event.py  # 错误事实进 session、堆栈进日志的端到端测试
 │   ├── test_ask_user_tool.py        # ask_user/confirm 与批准继续（approver）测试
 │   ├── test_policy_pre_step.py      # 命令治理：风险/工作目录/审批与 pre_step 拦截
+│   ├── test_token_meter.py          # TokenMeter：阈值/覆盖式赋值/reset/窗口 10000
+│   ├── test_compact.py              # Compactor：分块/二级降级 + 窗口 10000 端到端压缩
 │   └── test_bash_tool.py            # bash 执行层：回显/退出码/工作目录/超时
 ├── sessions/                   # 运行时生成：{session_id}.jsonl（会话事件，gitignore）
 └── logs/                       # 运行时生成：runtime.log（完整日志，gitignore）
@@ -266,12 +270,15 @@ agent = ReactAgent(tools=center, llm_client=...)
 
 - `Session(session_id=None, persist_dir="sessions")`：自动创建
   `{persist_dir}/{session_id}.jsonl`；
-- `append(event_type, data)`：内存记录 + 同步落盘，seq 使用持久化游标；
+- `append(event_type, data, *, turn=0, step=0)`：内存记录 + 同步落盘，seq 使用
+  持久化游标，事件携带 turn/step 上下文与 compacted 标记；
 - `append_error(location, error_type, message, detail=...)`：写入
   `runtime/error` 事件（错误事实，不含堆栈）；
 - `from_file(session_id, persist_dir, strict=False)`：恢复会话并校验事件
   seq 连续性（strict=True 时断层抛 `SessionContinuityError`）；文件缺失或
   某行 JSON 损坏抛 `SessionEditError`（含行号，完整堆栈进日志文件）；
+- `mark_compacted(seq_start, seq_end)` / `insert_after(index, type, data, *, turn, step)`：
+  压缩时对旧事件打标、插入 compact/summary 摘要事件并全量重写 JSONL（seq 恒为 0..N-1）；
 - 续聊：恢复 session 后，把新消息放入 `agent.inbox` 的 `turn` 队列再次
   调用 `agent.turn()` 即可基于历史继续。
 
@@ -289,10 +296,29 @@ restored = Session.from_file(agent.session.session_id)
 - **main**：把用户消息放入 `inbox` 的 `turn` 队列；
 - **turn**：持久化 turn/start + 用户消息 -> 循环执行 step -> turn/end；
 - **step**：仅从 `session.derive_messages()` 组装 LLM 输入 -> 调用
-  `llm_client.stream(...)` -> **产出即持久化**（LLM 消息与工具结果立即写
-  session）-> 返回 end_reason（'' / finish / max_token / error）；
+  `llm_client.stream(...)`（返回三元组：消息 / end_reason / usage）-> LLM
+  消息与工具结果**先入 `inbox.step` 队列**，由下一步的 pre_step claim 或
+  回合收尾统一写 session -> TokenMeter 按 usage 阈值检测，超阈值触发
+  Compactor 压缩 -> 返回 end_reason（'' / finish / max_token / error）；
 - **错误统一处理**：`ReactAgent._step` 捕获任何异常 -> 完整堆栈写入日志
   文件 -> location/error_type/message 摘要写入 session 的 runtime/error 事件。
+
+## 上下文压缩（TokenMeter + Compactor）
+
+长对话按「用量阈值 -> 摘要压缩 -> 最近一轮保留」策略防止上下文超窗：
+
+- `TokenMeter(max_context_tokens=128000, threshold_ratio=0.8)`：
+  覆盖式记录最近一次 LLM usage（total_tokens 是本次请求完整上下文大小，非增量）；
+  `is_over_threshold()` 在 total_tokens > threshold_tokens 时触发压缩；
+- `Compactor(session, summarize=None, llm_client=None)`：按 turn 分块、
+  排除最近一轮，把历史回合压缩为 `compact/summary` 摘要事件；无可压缩块时
+  降级二级全量压缩；摘要生成优先级为注入 summarize > LLM 客户端 > 保守截断；
+- `derive_messages()` 跳过 compacted 事件、把摘要包装为 UserMessage 重入上下文；
+  压缩后事件全量重写 JSONL，seq 连续可回放；
+- 小窗口验证：`ReactAgent(max_context_tokens=10000)` 端到端测试
+  （tests/test_compact.py::test_agent_context_window_10000_compacts_normally）
+  验证 10000 窗口下压缩**正常且准确**——旧回合被摘要替代、最近一轮完整保留、
+  摘要进入上下文、持久化 roundtrip seq 连续。
 
 ## 对接本地模型（llama.cpp + Qwen2.5-0.5B）
 

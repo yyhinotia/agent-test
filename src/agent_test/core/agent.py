@@ -6,9 +6,9 @@
   inbox.step，由下一步 pre_step claim 写入 session；回合收尾时
   刷空残留 step 消息，保证最终答复不丢失；
 - 上下文管理：TokenMeter 按 LLM usage 做阈值检测，超过阈值由
-  Compactor 两级压缩（历史 turn 摘要化为 compact/summary 事件）；
+  Compactor 两级压缩（历史上下文摘要化为 compact/summary 事件）；
 - 事件溯源：所有 session.append 携带 turn/step 上下文，Compactor
-  按 turn 分块并排除近期；
+  按 (turn,step) 全局排序、以 step 粒度排除近期（非按 turn）；
 - 错误统一处理：任何运行时异常 -> 完整堆栈写入日志文件（RuntimeLog），
   location + error_type + message 摘要写入 session（runtime/error 事件），
   二者通过 session_id 关联，方便回放与排查。
@@ -59,6 +59,9 @@ class ReactAgent:
         session: Session | None = None,
         max_context_tokens: int = 128000,
         threshold_ratio: float = 0.8,
+        remain_turns: int = 2,
+        tool_head: int = 1024,
+        tool_tail: int = 1024,
         token_meter: TokenMeter | None = None,
         compactor: Compactor | None = None,
     ):
@@ -68,7 +71,8 @@ class ReactAgent:
         - llm_client: LLM_CLIENT["openai"]（懒构建，需要 API_KEY 等环境变量）
         - tools:      全局 tool_center 单例（含内置 read/find/grep/edit/list/write 与 bash 命令执行工具）
         - inbox / session: 新建本 Agent 私有实例
-        - token_meter / compactor: 按 max_context_tokens / threshold_ratio 新建
+        - token_meter: 按 max_context_tokens / threshold_ratio 新建；
+        - compactor: 按 remain_turns / tool_head / tool_tail 新建
           （知识增量；测试可用 max_context_tokens=10000 验证小窗口压缩）
         """
         self.tool_center = tools if tools is not None else tool_center
@@ -93,7 +97,13 @@ class ReactAgent:
         self.compactor = (
             compactor
             if compactor is not None
-            else Compactor(session=self.session, llm_client=self.llm_client)
+            else Compactor(
+                session=self.session,
+                llm_client=self.llm_client,
+                remain_turns=remain_turns,
+                tool_head=tool_head,
+                tool_tail=tool_tail,
+            )
         )
         # 让 LLM 适配器能感知当前 session（用于错误事实记录）
         if hasattr(self.llm_client, "session"):
@@ -271,12 +281,10 @@ class ReactAgent:
                 step=self.phase.step,
             )
 
-    async def _compact_context(self) -> int:
-        """上下文压缩：一级保留最近一轮；无可压缩块时降级二级全量压缩。"""
-        count = await self.compactor.compact()
-        if count == 0:
-            count = await self.compactor.compact(recent_turns=0)
-        return count
+    async def _compact_context(self) -> str | None:
+        """上下文压缩：两级压缩——一级保留最近 remain_turns 个 step，
+        无可压缩事件时降级二级全量；返回摘要文本或 None。"""
+        return await self.compactor.compact()
 
     def _pre_step(
         self, tool_calls: list[ToolCallBlock]
