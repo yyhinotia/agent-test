@@ -202,13 +202,16 @@ class Compactor:
         seq_start = min(e.seq for e in eligible)
         seq_end = max(e.seq for e in eligible) + 1
         last_index = self.session.mark_compacted(seq_start, seq_end)
-        last_compacted = max(eligible, key=lambda e: e.seq)
+        # 摘要事件携带被压缩区间的 (turn, step) 上界——取区间最大值，
+        # 而不是区间末条事件的值（turn 级事件 step=0，取末条会让上界被
+        # 低估）。窗口化重载只读到摘要事件时，Session.max_turn_step
+        # 仍能给出续聊所需的编号上界，续聊不会与归档事件重号。
         self.session.insert_after(
             last_index,
             EventType.COMPACT,
             summary,
-            turn=last_compacted.turn,
-            step=0,
+            turn=max(event.turn for event in eligible),
+            step=max(event.step for event in eligible),
         )
         # 内存窗口化：被压缩旧事件从 events 移入归档（磁盘全量已由
         # insert_after 的 _persist_all 落盘）；events 只作为上下文窗口。

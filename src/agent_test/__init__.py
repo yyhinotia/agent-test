@@ -11,7 +11,7 @@
     policy/      命令治理策略（权限审批/危险/工作目录检测，pre_step 拦截）
     human/       用户交互服务（AskService：澄清/补充消息/批准继续）
 """
-from agent_test.core.agent import ReactAgent
+from agent_test.core.agent import ReactAgent, create_agent
 from agent_test.core.inbox import InBox
 from agent_test.policy import CommandPolicy, PolicyAction, PolicyDecision
 from agent_test.tools.bash import bash, register_bash
@@ -53,6 +53,7 @@ __all__ = [
     "AgentPhase",
     "AssistantMessage",
     "Compactor",
+    "create_agent",
     "EventType",
     "InBox",
     "LlmError",

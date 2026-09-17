@@ -772,3 +772,63 @@ suspend/confirm、LangGraph interrupt、Codex allow-and-remember，来源与对�
    `_renumber` 均纳入归档副本，保证磁盘 seq 全局连续；from_file 仍恢复全量
    可审计。新增 `test_compactor_memory_window_keeps_disk_full` 覆盖窗口化 /
    磁盘全量 / append 连续性 / 二次压缩稳定 / roundtrip 一致。
+10. **窗口化重载（session-reload）**：新增 `Session.reload(strict=False)`
+    ——从 JSONL 尾部**倒序**分块读取（`_iter_lines_reverse`，按块从文件尾
+    向前读、命中即停，不把全量历史载入内存），遇到第一条
+    `compact/summary` 事件即停止（含该事件），把「摘要 + 摘要之后的事件」
+    按正序载入 `events`，即续聊所需的最小上下文窗口；无 compact
+    事件时退化为加载全量。被跳过的磁盘前缀不载入内存但记账为
+    `_prefix_events`：`_renumber` 从该偏移起编号，`_persist_all` 经
+    `_rewrite_with_prefix` 先按行回填前缀再写窗口（同目录临时文件 +
+    `os.replace`，回填行数不符则拒绝替换），因此窗口化重载后再次
+    压缩也不会用内存窗口覆盖磁盘全量历史；`_seq` 取最后一条事件
+    seq + 1，重载后继续 append 与磁盘全局连续编号不冲突。from_file 与
+    reload 共用 `_parse_event_line`（行级损坏抛 SessionEditError，reload 报
+    「倒数第 N 行」）。新增 tests/test_session_reload.py（12 例：窗口边界 /
+    无 compact 退化 / 前缀不解析 / 续 append 连续 / 重载后再压缩保前缀 /
+    损坏行 / 空文件 / seq 断层 / 倒序迭代器 / agent 级续聊端到端）。
+11. **恢复编号（续聊续接已有 turn/step）**：`Session.max_turn_step()` 返回
+    全量事件（`_archived` 归档 + 内存窗口）中最大的 turn / step；
+    `ReactAgent.__init__` 据此初始化 `phase.turn / phase.step`（空 session
+    为 (0,0)，行为不变），因此 `from_file` 全量恢复或 `reload` 窗口恢复后
+    继续对话，turn / step 都从历史之后接着编号，不再从 1 重来（重号会破坏
+    Compactor 的 (turn,step) 全局排序）。配套：Compactor 的摘要事件不再写
+    `step=0`，而是携带被压缩区间的 (turn, step) **区间最大值**——窗口化
+    重载的窗口起点正是摘要事件，这样「二级全量压缩后窗口只剩摘要」的场景
+    也不丢编号上界。新增 5 例测试：max_turn_step 取值 / from_file 后续编号 /
+    reload 窗口续编号 / 全量压缩后由摘要带回上界 / 摘要带区间最大值。
+12. **空回合不消耗编号**：`ReactAgent.turn()` 改为**先探空再编号**——
+    `inbox.has_pending()` 为假时直接返回 False，不再递增 `phase.turn`，
+    也不再写入无内容的 turn/start 事件（原实现是「先编号 + 先写 turn/start
+    再 claim」，空调用会白耗一个 turn 号，与恢复编号叠加后会让续聊的回合
+    编号出现空洞）。回归测试：tests/test_core.py 新增
+    `test_turn_with_empty_inbox_writes_nothing`（空调用不消耗编号 / 不写事件 /
+    不调 LLM，之后第一个真实回合仍是 turn 1）；tests/test_session_reload.py 的
+    恢复编号用例补充「空 turn 不消耗已恢复编号」。
+13. **回合日志闭环（turn/end + reason）**：turn/start 一旦写出，本轮必定以
+    turn/end 收尾，data 携带 reason=finish / max_token / error；回合内出现意外
+    异常（_step 之外的错误，如收尾 flush 失败）时会先尽力补写
+    turn/end(reason=error) 再向上抛（写失败只记日志，不掩盖原始异常）。
+    `Phase.stage` 同时改用 `AgentPhase` 枚举（IDLE / RUNNING）并在 finally
+    复位，取代原先无类型、回合结束后仍停留在 "step" 的字符串 stage。
+    新增 2 例测试：reason + 阶段生命周期（含 LLM 抛错 -> reason=error）、
+    意外异常仍闭合回合日志。
+14. **残缺尾部容错（torn tail）**：from_file / reload 遇到「末行无换行结尾 +
+    解析失败」时判定为上次写入被截断：告警、跳过该行并清理磁盘
+    残片（from_file 全量重写；reload 经 _rewrite_with_prefix 保留前缀与窗口）；
+    中间行损坏仍抛 SessionEditError。append 改为二进制追加并先
+    _trim_torn_tail：末字节非换行时回退到最后一个换行处 truncate，
+    避免新事件与残片拼成无法解析的行（该场景此前会让整个会话
+    文件不可恢复）。新增 tests/test_session_torn_tail.py（4 例）。
+15. **生命周期工厂 + session-reload 接口（模块 6）**：新增统一构造入口
+    `create_agent(session_id=None, persist_dir="sessions", *, resume=False,
+    strict=False, **kwargs)`：新建（默认）或续聊（resume=True）；
+    `create_agent(session_id=...)` 命中**已存在且非空**的会话文件时直接抛
+    `SessionEditError`（location=create_agent）提示改用 resume——否则新 Agent
+    会从 seq 0 / turn 1 重编号，与磁盘历史冲突。配套两个类方法快捷方式：
+    `ReactAgent.resume(session_id, persist_dir, *, strict=False, **kwargs)`（窗口化重载 +
+    续接编号 + 构造）与 `Session.resume(...)`（= `Session(...).reload()`，与
+    `from_file` 构成「全量回放 / 窗口续聊」对偶）。演示入口 `main.py`
+    改用 `create_agent` 并新增 `--resume <session_id>`（argparse），回合结束后输出续聊命令。
+    新增 tests/test_create_agent.py（7 例：新建 / 拒绝重开已有会话 / resume 窗口+编号+seq /
+    类方法等价 / Session.resume == reload / 参数校验 / CLI 解析）。

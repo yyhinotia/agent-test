@@ -15,7 +15,10 @@
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 from agent_test.core.inbox import InBox
+from agent_test.exceptions.session import SessionEditError
 from agent_test.llm.compactor import Compactor
 from agent_test.llm.registry import LLM_CLIENT
 from agent_test.llm.token_meter import TokenMeter
@@ -23,7 +26,7 @@ from agent_test.log.runtime_log import RuntimeLog
 from agent_test.policy import PolicyAction, PolicyDecision
 from agent_test.session.session import Session
 from agent_test.tools import tool_center
-from agent_test.types.events import EventType, Phase
+from agent_test.types.events import AgentPhase, EventType, Phase
 from agent_test.types.messages import (
     AssistantMessage,
     Message,
@@ -86,6 +89,10 @@ class ReactAgent:
             else Session(session_id=session_id, persist_dir=persist_dir)
         )
         self.phase = Phase()
+        # 恢复已有编号（注入已有 session / from_file 全量 / reload 窗口）：
+        # turn 与 step 续接 session 中已用过的最大编号，续聊不会与历史事件
+        # 重号（step 是全局递增计数器）。空 session 为 (0, 0)，行为不变。
+        self.phase.turn, self.phase.step = self.session.max_turn_step()
         self.token_meter = (
             token_meter
             if token_meter is not None
@@ -109,19 +116,57 @@ class ReactAgent:
         if hasattr(self.llm_client, "session"):
             self.llm_client.session = self.session
 
+    @classmethod
+    def resume(
+        cls,
+        session_id: str,
+        persist_dir: str = "sessions",
+        *,
+        strict: bool = False,
+        **kwargs,
+    ) -> "ReactAgent":
+        """窗口化恢复已有会话并构造 Agent（续聊入口）。
+
+        一条调用完成三件事：
+        1. Session.resume(...)：从 JSONL 尾部倒序读取，只加载「最近一次
+           压缩之后」的上下文窗口（见 Session.reload）；
+        2. 续接编号：构造时 phase.turn / phase.step 取会话已有事件的最大
+           编号（见 Session.max_turn_step），新回合不与历史重号；
+        3. 继续追加：session._seq 取磁盘全局下一条 seq，新事件接在全量
+           历史之后，磁盘 seq 仍连续。
+
+        其余关键字参数原样透传给构造函数（llm_client / tools / inbox /
+        max_context_tokens / threshold_ratio / remain_turns / tool_head /
+        tool_tail / token_meter / compactor）。会话文件不存在时会被创建，
+        等价于在该 session_id 下开一段新会话。
+        """
+        session = Session.resume(session_id, persist_dir, strict=strict)
+        return cls(session=session, **kwargs)
+
     async def turn(self) -> bool:
         """执行一轮对话。
 
         返回 True 表示本轮已执行（无论是否报错，错误见 session/日志）；
-        返回 False 表示 inbox 中没有待处理消息。
+        返回 False 表示 inbox 中没有待处理消息——此时不递增回合编号、
+        不写入任何事件（先探空再编号，否则会白耗一个 turn 号并留下
+        无内容的 turn/start 事件）。
+
+        回合日志闭环：turn/start 一旦写出，本轮必定以 turn/end 收尾，
+        data 携带 reason=finish / max_token / error；回合内出现意外异常
+        时也会尽力补写 turn/end(reason=error)，不出现「开了没关」的回合。
+        phase.stage 在回合内为 RUNNING，回合结束（含异常）复位 IDLE。
         """
+        if not self.inbox.has_pending():
+            return False
+
         self.phase.turn += 1
-        self.phase.stage = "turn"
+        self.phase.stage = AgentPhase.RUNNING
+        turn_no = self.phase.turn
         tokens = RuntimeLog.bind(
-            session_id=self.session.session_id, turn=self.phase.turn
+            session_id=self.session.session_id, turn=turn_no
         )
+        end_reason = "error"  # 未走到 break 即异常 -> error
         try:
-            turn_no = self.phase.turn
             self.session.append(
                 EventType.TURN_START, data={"turn": turn_no}, turn=turn_no
             )
@@ -142,25 +187,48 @@ class ReactAgent:
                 end_reason = await self._step()
                 if end_reason in ("max_token", "finish", "error"):
                     break
-                self.phase.stage = "step"
+                # end_reason == ''：本步只是工具调用，继续下一步
 
             # 3. 收尾：刷空残留在 inbox.step 的最终答复/工具结果
             self._flush_step_messages()
 
-            self.session.append(
-                EventType.TURN_END, data={"turn": turn_no}, turn=turn_no
-            )
+            self._append_turn_end(turn_no, end_reason)
             return True
         except Exception:
-            # 回合级意外异常：堆栈进日志文件（session 可能已损坏无法写入）
+            # 回合级意外异常：先尽力补写 turn/end(reason=error) 闭合回合
+            # 日志，再记完整堆栈并向上抛（session 可能已不可写）
             RuntimeLog.capture_exception(
                 exc=None,
-                location=f"ReactAgent.turn[turn={self.phase.turn}]",
+                location=f"ReactAgent.turn[turn={turn_no}]",
                 detail={"session_id": self.session.session_id},
             )
+            self._close_turn_best_effort(turn_no)
             raise
         finally:
+            self.phase.stage = AgentPhase.IDLE
             RuntimeLog.unbind(tokens)
+
+    def _append_turn_end(self, turn_no: int, reason: str) -> None:
+        """写入回合收尾事件 turn/end（reason: finish / max_token / error）。"""
+        self.session.append(
+            EventType.TURN_END,
+            data={"turn": turn_no, "reason": reason},
+            turn=turn_no,
+        )
+
+    def _close_turn_best_effort(self, turn_no: int) -> None:
+        """异常路径下尽力补写 turn/end(reason=error)。
+
+        写失败只记日志：调用方真正需要看到的是原始异常，不能被「日志写入
+        失败」掩盖。
+        """
+        try:
+            self._append_turn_end(turn_no, "error")
+        except Exception:  # noqa: BLE001
+            RuntimeLog.exception(
+                "异常路径 turn/end 写入失败（session 可能不可写）: %s",
+                self.session.file_path,
+            )
 
     async def _step(self) -> str:
         """执行一步：claim step 消息 -> 组装上下文 -> 调用 LLM -> 执行工具。
@@ -322,3 +390,49 @@ class ReactAgent:
                     decision.tool_name,
                 )
         return decisions
+
+
+def create_agent(
+    session_id: str | None = None,
+    persist_dir: str = "sessions",
+    *,
+    resume: bool = False,
+    strict: bool = False,
+    **kwargs,
+) -> ReactAgent:
+    """Agent 统一构造入口（生命周期工厂）。
+
+    新建（默认）：
+        create_agent()：自动生成 session_id 的新 Agent；
+        create_agent(session_id="s-1")：指定 id 的新会话——若该文件已存在
+        且非空，说明这是续聊场景，直接抛 SessionEditError 提示改用 resume，
+        否则新 Agent 会从 seq 0 / turn 1 重新编号并与磁盘历史冲突。
+
+    续聊（resume=True）：
+        create_agent(session_id="s-1", resume=True)：窗口化恢复（等价
+        ReactAgent.resume(...)）——只加载最近一次压缩之后的窗口，并自动
+        续接已有 turn/step 编号与全量 seq。
+
+    其余关键字参数原样透传给 ReactAgent（llm_client / tools / inbox /
+    max_context_tokens / threshold_ratio / remain_turns / tool_head /
+    tool_tail / token_meter / compactor）。
+    """
+    if resume:
+        if session_id is None:
+            raise ValueError("resume=True 必须提供 session_id")
+        if "session" in kwargs:
+            raise ValueError("resume=True 不接受 session=（请改用 session_id）")
+        return ReactAgent.resume(
+            session_id, persist_dir, strict=strict, **kwargs
+        )
+
+    if session_id is not None:
+        existing = Path(persist_dir) / f"{session_id}.jsonl"
+        if existing.exists() and existing.stat().st_size > 0:
+            raise SessionEditError(
+                f"会话已存在且非空，续聊请用 resume=True 或 ReactAgent.resume: "
+                f"{existing}",
+                location="create_agent",
+                detail={"session_id": session_id, "file_path": str(existing)},
+            )
+    return ReactAgent(session_id=session_id, persist_dir=persist_dir, **kwargs)

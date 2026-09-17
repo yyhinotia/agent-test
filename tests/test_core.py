@@ -1,6 +1,8 @@
 """核心组件的本地冒烟测试（不依赖网络 / API Key）。"""
 import asyncio
 
+import pytest
+
 from agent_test.core.inbox import InBox
 from agent_test.llm.adapter import LLMBaseAdapter
 from agent_test.llm.registry import LLM_CLIENT
@@ -250,3 +252,126 @@ def test_react_agent_loop_with_fake_llm(monkeypatch, tmp_path):
         if line.strip()
     ]
     assert len(lines) == len(agent.session.events)
+
+
+def test_turn_with_empty_inbox_writes_nothing(monkeypatch, tmp_path):
+    """空 inbox 调 turn()：返回 False，不消耗回合编号、不写事件、不调 LLM。"""
+    LLM_CLIENT.clear()
+    monkeypatch.setenv("API_KEY", "sk-test")
+    monkeypatch.setenv("BASE_URI", "https://api.openai.com/v1")
+    monkeypatch.setenv("MODEL_NAME", "gpt-4o-mini")
+    from agent_test import ReactAgent
+
+    calls = {"n": 0}
+
+    class CountingLLM:
+        async def stream(self, messages, tools):
+            calls["n"] += 1
+            return (
+                AssistantMessage(id="a1", content=[TextBlock(content="ok")]),
+                "finish",
+                None,
+            )
+
+    agent = ReactAgent(persist_dir=str(tmp_path))
+    agent.llm_client = CountingLLM()
+
+    assert asyncio.run(agent.turn()) is False
+    assert agent.phase.turn == 0  # 不消耗回合编号
+    assert agent.session.events == []  # 不写 turn/start
+    assert agent.session.file_path.read_text(encoding="utf-8") == ""
+    assert calls["n"] == 0  # 不调用 LLM
+
+    # 空调用之后，第一个真实回合仍是 turn 1
+    agent.inbox.append("turn", UserMessage(id="u1", content=[TextBlock(content="hi")]))
+    assert asyncio.run(agent.turn()) is True
+    assert agent.phase.turn == 1
+    turn_starts = [e for e in agent.session.events if e.type == "turn/start"]
+    assert [e.turn for e in turn_starts] == [1]
+
+
+def test_turn_end_carries_reason_and_phase_lifecycle(monkeypatch, tmp_path):
+    """turn/end 带 reason；phase.stage 回合内 RUNNING、结束后 IDLE。"""
+    from agent_test import ReactAgent
+    from agent_test.types.events import AgentPhase
+
+    LLM_CLIENT.clear()
+    monkeypatch.setenv("API_KEY", "sk-test")
+    monkeypatch.setenv("BASE_URI", "https://api.openai.com/v1")
+    monkeypatch.setenv("MODEL_NAME", "gpt-4o-mini")
+
+    seen_stage = []
+
+    class StageProbe:
+        """记录调用时的 phase.stage，并按指定 reason 返回或抛错。"""
+
+        def __init__(self, agent, mode):
+            self.agent = agent
+            self.mode = mode
+
+        async def stream(self, messages, tools):
+            seen_stage.append(self.agent.phase.stage)
+            if self.mode == "raise":
+                raise RuntimeError("LLM 崩了")
+            return (
+                AssistantMessage(id="a1", content=[TextBlock(content="ok")]),
+                self.mode,
+                None,
+            )
+
+    agent = ReactAgent(persist_dir=str(tmp_path))
+    assert agent.phase.stage is AgentPhase.IDLE  # 初始 idle
+
+    agent.llm_client = StageProbe(agent, "finish")
+    agent.inbox.append("turn", UserMessage(id="u1", content=[TextBlock(content="hi")]))
+    assert asyncio.run(agent.turn()) is True
+    assert seen_stage == [AgentPhase.RUNNING]  # LLM 调用发生在 RUNNING 阶段
+    ends = [e for e in agent.session.events if e.type == "turn/end"]
+    assert ends[-1].data == {"turn": 1, "reason": "finish"}
+    assert agent.phase.stage is AgentPhase.IDLE  # 回合结束复位
+
+    # LLM 抛异常 -> _step 归一为 error，turn/end 仍写 reason=error
+    agent.llm_client = StageProbe(agent, "raise")
+    agent.inbox.append("turn", UserMessage(id="u2", content=[TextBlock(content="hi")]))
+    assert asyncio.run(agent.turn()) is True
+    ends = [e for e in agent.session.events if e.type == "turn/end"]
+    assert ends[-1].data == {"turn": 2, "reason": "error"}
+    assert agent.phase.stage is AgentPhase.IDLE
+
+
+def test_turn_end_written_when_turn_raises_unexpectedly(monkeypatch, tmp_path):
+    """回合内意外异常：补写 turn/end(reason=error)，且保留原始异常。"""
+    from agent_test import ReactAgent
+    from agent_test.types.events import AgentPhase
+
+    LLM_CLIENT.clear()
+    monkeypatch.setenv("API_KEY", "sk-test")
+    monkeypatch.setenv("BASE_URI", "https://api.openai.com/v1")
+    monkeypatch.setenv("MODEL_NAME", "gpt-4o-mini")
+
+    agent = ReactAgent(persist_dir=str(tmp_path))
+
+    async def boom_step():
+        raise RuntimeError("step 崩了")
+
+    monkeypatch.setattr(agent, "_step", boom_step)
+    agent.inbox.append("turn", UserMessage(id="u1", content=[TextBlock(content="hi")]))
+
+    with pytest.raises(RuntimeError, match="step 崩了"):
+        asyncio.run(agent.turn())
+
+    # 回合日志闭环：turn/start 已写出 -> 必定有 turn/end 收尾
+    assert [e.type for e in agent.session.events] == [
+        "turn/start",
+        "user/message",
+        "turn/end",
+    ]
+    assert agent.session.events[-1].data == {"turn": 1, "reason": "error"}
+    assert agent.phase.stage is AgentPhase.IDLE
+    # 落盘一致：turn/end 也进了 JSONL
+    lines = [
+        line
+        for line in agent.session.file_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(lines) == 3

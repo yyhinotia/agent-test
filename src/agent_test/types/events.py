@@ -30,12 +30,19 @@ class AgentPhase(str, Enum):
 
 
 class Phase:
-    """对话阶段计数器：回合（turn）与步骤（step）编号 + 当前阶段名。"""
+    """对话阶段计数器：回合（turn）与步骤（step）编号 + 顶层生命周期阶段。
+
+    stage 用 AgentPhase 枚举而不是字符串字面量（知识增量）：
+    - IDLE：未在执行回合（初始状态、回合结束后）；
+    - RUNNING：turn() 正在执行（turn/start 已写出，尚未收尾）。
+    回合与步骤的细分位置由 turn/step 计数器与 session 事件表达，不再用
+    无类型的 "turn" / "step" 字符串（既无消费者也容易拼错）。
+    """
 
     def __init__(self) -> None:
         self.turn: int = 0
         self.step: int = 0
-        self.stage: str = "turn"
+        self.stage: AgentPhase = AgentPhase.IDLE
 
 
 class SessionEvent(BaseModel):

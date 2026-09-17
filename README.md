@@ -277,24 +277,57 @@ agent = ReactAgent(tools=center, llm_client=...)
 - `from_file(session_id, persist_dir, strict=False)`：恢复会话并校验事件
   seq 连续性（strict=True 时断层抛 `SessionContinuityError`）；文件缺失或
   某行 JSON 损坏抛 `SessionEditError`（含行号，完整堆栈进日志文件）；
+- `reload(strict=False)`：**窗口化重载**（实例方法）——从 JSONL 尾部倒序
+  读取，遇到第一条 `compact/summary` 事件即停止（含该事件），只把
+  「摘要 + 摘要之后的事件」载入 `events`（续聊所需的最小上下文窗口；
+  无 compact 事件时退化为加载全量）；被跳过的磁盘前缀不载入内存但
+  记账为 `_prefix_events`，之后 `_persist_all` 会按行回填，磁盘仍是全量历史；
+  `_seq` 取最后一条事件 seq + 1，重载后继续 `append` 不冲突；
 - `mark_compacted(seq_start, seq_end)` / `insert_after(index, type, data, *, turn, step)`：
   压缩时对旧事件打标、插入 compact/summary 摘要事件并全量重写 JSONL（seq 恒为 0..N-1）；
+- `max_turn_step()`：返回全量事件（`_archived` 归档 + 内存窗口）中最大的
+  turn / step；`ReactAgent` 构造时据此**续接已有编号**——`from_file` 或
+  `reload` 恢复后继续对话，turn / step 从历史之后接着编号，不会与既有事件
+  重号（step 是全局递增计数器，重号会破坏 Compactor 的 (turn, step) 排序）；
+  摘要事件携带被压缩区间的 (turn, step) 上界，所以窗口化重载只读到摘要时
+  编号上界也不丢；
+- 工厂入口（模块 6）：`create_agent(session_id=None, persist_dir="sessions", *, resume=False)`
+  ——新建与续聊的统一构造入口；`resume=True` 走窗口化重载（session-reload）
+  并自动续接已有 turn/step 编号与全量 seq。`ReactAgent.resume(...)` /
+  `Session.resume(...)` 是对应的类方法快捷方式；`create_agent` 在 session_id 已存在
+  且非空时**拒绝新建**（否则会从 seq 0 / turn 1 重编号与磁盘历史冲突），
+  并提示改用 resume；演示入口：`uv run python main.py --resume <session_id> "..."`；
+- 容错：`from_file` / `reload` 遇到「写一半」的末尾残行（无换行结尾 + 解析
+  失败）会告警跳过并清理磁盘残片（中间行损坏仍抛
+  `SessionEditError`）；`append` 前也会先清掉残片，避免新事件与残片拼成
+  无法解析的一行；
 - 续聊：恢复 session 后，把新消息放入 `agent.inbox` 的 `turn` 队列再次
-  调用 `agent.turn()` 即可基于历史继续。
+  调用 `agent.turn()` 即可基于历史继续（编号自动续接）。
 
 ```python
-from agent_test import ReactAgent, Session
+from agent_test import ReactAgent, Session, create_agent
 
 agent = ReactAgent()                      # 自动生成 session_id 与 sessions/{id}.jsonl
 print(agent.session.session_id)
 print(agent.session.file_path)
 restored = Session.from_file(agent.session.session_id)
+
+# 续聊（session-reload）：一条调用完成「窗口化重载 + 续接编号」
+agent2 = create_agent(agent.session.session_id, resume=True)
+# 等价写法：ReactAgent.resume(agent.session.session_id)
+# 只需 session（窗口）时：Session.resume(agent.session.session_id)
 ```
 
 ## 架构要点（turn / step）
 
 - **main**：把用户消息放入 `inbox` 的 `turn` 队列；
 - **turn**：持久化 turn/start + 用户消息 -> 循环执行 step -> turn/end；
+  空 inbox 调用 `turn()` 直接返回 False——**不递增回合编号、不写任何事件**
+  （先探空再编号，避免白耗 turn 号并留下无内容的 turn/start）；
+- **回合日志闭环**：turn/start 一旦写出，本轮必定以 turn/end 收尾，
+  `data` 携带 `reason`（finish / max_token / error）；回合内出现意外异常时
+  也会尽力补写 turn/end(reason=error)；`phase.stage` 用 `AgentPhase`，
+  回合内为 RUNNING、回合结束（含异常）复位 IDLE；
 - **step**：仅从 `session.derive_messages()` 组装 LLM 输入 -> 调用
   `llm_client.stream(...)`（返回三元组：消息 / end_reason / usage）-> LLM
   消息与工具结果**先入 `inbox.step` 队列**，由下一步的 pre_step claim 或
