@@ -21,25 +21,67 @@ from openai import AsyncOpenAI
 
 from agent_test.exceptions.llm import LlmError
 from agent_test.types.messages import (
+    ApprovalResult,
     AssistantMessage,
+    ExecutionResult,
     Message,
     TextBlock,
     ToolCallBlock,
     ToolResultMessage,
     UserMessage,
 )
+from agent_test.core.prompts import system_prompt as system_prompt_default
 from agent_test.utils import get_uuid
 
 load_dotenv()
 
 
-class LLMBaseAdapter:
-    """LLM 适配器基类：负责把内部 Message 列表组装为 OpenAI 消息格式。"""
+# 审批 / 执行标签（知识增量）：把双状态机渲染成 LLM 可读的标签行，
+# 让模型能区分「审批被拒、从未执行」与「已执行但失败」。
+_APPROVAL_LABELS = {
+    "auto": "审批:自动放行",
+    "approved": "审批:用户已批准",
+    "denied": "审批:用户拒绝执行",
+    "blocked": "审批:策略直接拦截",
+}
 
-    def __init__(self) -> None:
+_EXECUTION_LABELS = {
+    "not_started": "执行:未开始(审批未通过)",
+    "success": "执行:成功",
+    "failed": "执行:失败",
+}
+
+
+def _format_approval(approval: ApprovalResult) -> str:
+    """审批标签：[审批:用户拒绝执行](user_denied)。"""
+    label = _APPROVAL_LABELS.get(approval.decision, approval.decision)
+    extra = f"({approval.reason_code})" if approval.reason_code else ""
+    return f"[{label}]{extra}"
+
+
+def _format_execution(execution: ExecutionResult) -> str:
+    """执行标签：[执行:失败](错误摘要)。"""
+    label = _EXECUTION_LABELS.get(execution.status, execution.status)
+    extra = f"({execution.error})" if execution.error else ""
+    return f"[{label}]{extra}"
+
+
+class LLMBaseAdapter:
+    """LLM 适配器基类：负责把内部 Message 列表组装为 OpenAI 消息格式。
+
+    system_prompt：缺省注入 core/prompts.py 的结构化提示词
+    （首轮环境检查 + shell 语法硬性规则 + 审批/执行状态语义），
+    构造时传 system_prompt=... 可覆盖。
+    """
+
+    def __init__(self, system_prompt: str | None = None) -> None:
         self.client = None
         self.model_name = None
-        self.system_prompt = "你是一个有用的AI助手"
+        self.system_prompt = (
+            system_prompt
+            if system_prompt is not None
+            else system_prompt_default
+        )
         self.session = None
 
     def assemble_messages(self, messages: List[Message]) -> List[Dict[str, Any]]:
@@ -83,6 +125,15 @@ class LLMBaseAdapter:
 
             elif isinstance(message, ToolResultMessage):
                 text = "\n".join(block.content for block in message.content)
+                # 审批/执行标签渲染（知识增量）：把双状态机前置为标签行，
+                # LLM 才能分辨「用户拒绝」与「执行失败」。
+                labels: List[str] = []
+                if message.approval is not None:
+                    labels.append(_format_approval(message.approval))
+                if message.execution is not None:
+                    labels.append(_format_execution(message.execution))
+                if labels:
+                    text = " ".join(labels) + "\n" + text
                 openai_messages.append(
                     {
                         "role": "tool",

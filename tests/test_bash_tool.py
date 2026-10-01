@@ -1,5 +1,6 @@
 """bash 工具执行层测试：回显 / 退出码 / 工作目录 / 超时 / 参数错误。"""
 import asyncio
+import codecs
 import sys
 from pathlib import Path
 
@@ -7,7 +8,11 @@ import pytest
 
 from agent_test.exceptions.tools import ToolExecutionError
 from agent_test.tools import tool_center
-from agent_test.tools.bash import bash, register_bash
+from agent_test.tools.bash import (
+    bash,
+    default_encoding,
+    register_bash,
+)
 from agent_test.tools.center import ToolCenter
 
 IS_WIN = sys.platform.startswith("win")
@@ -79,6 +84,59 @@ def test_bash_empty_command_rejected():
 def test_bash_unknown_encoding_rejected():
     with pytest.raises(ToolExecutionError):
         asyncio.run(bash("echo hi", encoding="no-such-codec"))
+
+
+def test_bash_child_stdin_is_isolated(tmp_path):
+    """子进程 stdin=DEVNULL：读 stdin 立即 EOF，不抢占父进程终端行缓冲区。"""
+    code = "import sys;print(repr(sys.stdin.read()))"
+    cmd = f'"{sys.executable}" -c "{code}"'
+    result = asyncio.run(bash(cmd, workdir=str(tmp_path)))
+    assert result["exit_code"] == 0
+    assert result["stdout"].strip() == "''"
+
+
+def test_bash_default_encoding_is_platform_aware():
+    """缺省编码按平台自动选：POSIX 固定 utf-8，Windows 取控制台/系统代码页。"""
+    if IS_WIN:
+        codecs.lookup(default_encoding())
+        assert default_encoding() != "", "Windows 必须探测出可用代码页"
+    else:
+        assert default_encoding() == "utf-8"
+
+
+def test_bash_reports_encoding_used_and_allows_override():
+    """返回值带本次使用的编码；显式传参即以参数为准。"""
+    auto = asyncio.run(bash("echo hi"))
+    assert auto["encoding"] == default_encoding()
+    explicit = asyncio.run(bash("echo hi", encoding="utf-8"))
+    assert explicit["encoding"] == "utf-8"
+
+
+def test_bash_default_encoding_round_trips_console_text():
+    """中文回显在默认编码下不再变成替换字符（原先默认 utf-8 在 cp936 控制台会踩坑）。"""
+    result = asyncio.run(bash("echo 中文-agent-test"))
+    assert result["exit_code"] == 0
+    assert "\ufffd" not in result["stdout"], result["stdout"]
+    assert "中文-agent-test" in result["stdout"]
+
+
+@pytest.mark.skipif(not IS_WIN, reason="GBK 回退候选只在 Windows 上生成")
+def test_bash_auto_encoding_recovers_gbk_output():
+    """控制台是 UTF-8、子进程却吐 GBK 字节：自动候选兜底到 gbk，而非留下乱码。"""
+    code = "import sys;sys.stdout.buffer.write('中文GBK回显'.encode('gbk'))"
+    result = asyncio.run(bash(f'"{sys.executable}" -c "{code}"'))
+    assert result["exit_code"] == 0
+    assert result["stdout"].strip() == "中文GBK回显"
+    assert "\ufffd" not in result["stdout"]
+
+
+@pytest.mark.skipif(not IS_WIN, reason="GBK 编解码是中文 Windows 场景")
+def test_bash_explicit_encoding_overrides_auto():
+    """显式 encoding 优先于平台默认（不参与候选兜底之外的替换）。"""
+    code = "import sys;sys.stdout.buffer.write('中文GBK回显'.encode('gbk'))"
+    result = asyncio.run(bash(f'"{sys.executable}" -c "{code}"', encoding="gbk"))
+    assert result["encoding"] == "gbk"
+    assert result["stdout"].strip() == "中文GBK回显"
 
 
 def test_bash_truncates_huge_output():

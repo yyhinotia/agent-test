@@ -34,6 +34,9 @@ _COMPACT_PROMPT = (
     "Primary Request / Key Technical Concepts / Files and Code / "
     "Errors and Fixes / Pending Jobs / Current Work / Next Step / "
     "Critical Context\n\n"
+    "Critical Context 必须保留：执行环境信息（操作系统、shell 类型、"
+    "工作目录、解释器/运行时版本）与审批状态（哪些工具被用户拒绝、"
+    "哪些命令已批准并记住前缀），否则后续步骤会重复踩坑或重复申请审批。\n\n"
 )
 
 Summarizer = Callable[[str], str | Awaitable[str]]
@@ -111,10 +114,28 @@ class Compactor:
                 f"{_text_of(data)}"
             )
         if isinstance(data, ToolResultMessage):
-            marker = "error" if data.is_error else "ok"
+            # 双状态机（知识增量）：优先用 execution.status 表达执行结果，
+            # 审批状态单独标注；not_started 与 failed 语义不同，压缩后
+            # 不能让「审批被拒」退化成普通「执行失败」。
+            approval = data.approval
+            execution = data.execution
+            if execution is not None:
+                # 新事件：以执行状态机为准（not_started/success/failed）
+                marker = execution.status
+            else:
+                # 旧 JSONL 无 execution 字段：保持既有 ok/error 契约
+                marker = "error" if data.is_error else "ok"
+            labels: List[str] = []
+            if approval is not None:
+                labels.append(f"approval={approval.decision}")
+                if approval.reason_code:
+                    labels.append(f"reason={approval.reason_code}")
+            if execution is not None and execution.error:
+                labels.append(f"error={execution.error}")
+            suffix = (" " + " ".join(labels)) if labels else ""
             return (
                 f"[turn={event.turn} step={event.step}] "
-                f"tool:{data.tool_call_id}:{marker}: "
+                f"tool:{data.tool_call_id}:{marker}{suffix}: "
                 f"{self._clip_tool_result(_text_of(data))}"
             )
         return None

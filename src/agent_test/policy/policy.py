@@ -31,6 +31,33 @@ _PATH_PATTERN = re.compile(
     r"[A-Za-z]:[\\/][^\s\"'|;&<>]+|/(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+"
 )
 
+# 虚拟路径 / 设备文件：没有真实工作区语义，不参与「工作区之外」判定，
+# 否则 /dev/null、nul 这类重定向目标会把无害命令误判为越界需审批。
+_VIRTUAL_PATHS = frozenset(
+    {
+        "/dev/null",
+        "/dev/zero",
+        "/dev/stdin",
+        "/dev/stdout",
+        "/dev/stderr",
+        "/dev/random",
+        "/dev/urandom",
+        "/dev/tty",
+        "nul",
+        "con",
+        "aux",
+        "prn",
+    }
+)
+
+
+def _is_virtual_path(token: str) -> bool:
+    """虚拟路径/设备文件判定（大小写不敏感，含 Windows 保留名）。"""
+    lowered = token.lower()
+    if lowered in _VIRTUAL_PATHS:
+        return True
+    return Path(token).name.lower() in _VIRTUAL_PATHS
+
 
 class PolicyAction(str, Enum):
     EXECUTE = "execute"
@@ -102,14 +129,20 @@ class CommandPolicy:
         workdir: str | None = None,
         default_cwd: Path | None = None,
     ) -> PolicyDecision:
-        """对一条命令做完整决策：工作目录检测 -> allowlist -> 静态规则 -> 越界。"""
+        """对一条命令做完整决策：工作目录检测 -> allowlist -> 静态规则 -> 越界。
+
+        越界的两种形态都是「保守要求审批」而不是直接拒绝：命令里出现工作区
+        之外的文件路径，或 workdir 指向允许工作区之外的目录（后者批准后可
+        经 add_allowed_root 记住）。
+        """
         detail: dict = {"tool": tool_name, "command": command}
 
         # 1) 工作目录检测（含工作区越界）
         check = self.resolve_workdir(workdir, default_cwd=default_cwd)
         detail["cwd"] = str(check.cwd) if check.ok else None
         detail["requested_workdir"] = workdir
-        if not check.ok:
+        if not check.ok and not check.outside:
+            # 不存在 / 不是目录：不可审批的参数错误，直接拒绝
             return PolicyDecision(
                 PolicyAction.DENY,
                 tool_name,
@@ -117,7 +150,14 @@ class CommandPolicy:
                 detail=detail,
             )
 
-        reasons: list[str] = [f"工作目录检测: {check.note}"]
+        if check.ok:
+            reasons: list[str] = [f"工作目录检测: {check.note}"]
+        else:
+            # 工作目录越界：语义对齐「工作区之外的文件路径」——目录本身可用，
+            # 只是超出沙箱，保守要求审批；批准后由 _approve 记入允许根，
+            # 本会话内同一目录不再逐条打扰。
+            detail["outside_workdir"] = str(check.cwd)
+            reasons = [f"工作目录超出允许工作区，需审批: {check.cwd}"]
 
         # 2) 已审批命令前缀（allowlist）-> 直接放行
         if self._match_allowlist(command):
@@ -132,13 +172,16 @@ class CommandPolicy:
             reasons.append(finding.format())
         severity = highest_severity(findings)
 
-        # 4) 工作区外路径检测（保守：越界至少要求审批）
+        # 4) 越界检测（保守：越界至少要求审批）——工作区外的文件路径，
+        #    以及超出允许工作区的工作目录
         outside = self._outside_paths(command)
         if self.detect_outside_paths and outside and severity is None:
             reasons.append(
                 "命令涉及允许工作区之外的路径，需审批: "
                 + ", ".join(sorted(outside)[:5])
             )
+            severity = RiskSeverity.APPROVE
+        if detail.get("outside_workdir") and severity is None:
             severity = RiskSeverity.APPROVE
 
         if severity is RiskSeverity.DENY:
@@ -195,6 +238,46 @@ class CommandPolicy:
         prefix = tokens if len(tokens) < 2 else tokens[:2]
         self.add_allowlist_prefix(prefix)
 
+    def add_allowed_root(self, path: str | Path) -> bool:
+        """把一条已审批的越界路径加入允许根（会话级记忆）。
+
+        返回是否新增：已位于现有允许根之内（含相等）时不重复添加。
+        """
+        try:
+            resolved = Path(path).expanduser().resolve()
+        except OSError:
+            return False
+        if any(_is_inside(resolved, root) for root in self.allowed_roots):
+            return False
+        self.allowed_roots.append(resolved)
+        return True
+
+    def remember_approval(self, command: str, detail: dict | None = None) -> None:
+        """记住一次已获准的调用：命令前缀 + 越界路径 + 越界工作目录。
+
+        审批放行后的统一记忆入口，Agent 的 _pre_step（core/agent._approve）
+        与 ToolCenter.execute 的直接审批路径共用，避免两处逻辑漂移。
+        """
+        if command:
+            self.add_allowlist_for_command(command)
+            self.add_outside_paths_for_command(command)
+        outside_workdir = (detail or {}).get("outside_workdir")
+        if outside_workdir:
+            self.add_allowed_root(outside_workdir)
+
+    def add_outside_paths_for_command(self, command: str) -> list[Path]:
+        """把命令中本次已审批的越界路径纳入允许根。
+
+        语义与命令前缀 allowlist 对齐：用户批准过一次
+        `type C:\\Windows\\win.ini`，后续涉及同一路径的命令不再逐条审批。
+        """
+        added: list[Path] = []
+        for token in sorted(self._outside_paths(command)):
+            resolved = Path(token).expanduser().resolve()
+            if self.add_allowed_root(resolved):
+                added.append(resolved)
+        return added
+
     # ---------- 内部实现 ----------
 
     def _match_allowlist(self, command: str) -> bool:
@@ -214,6 +297,8 @@ class CommandPolicy:
         outside: set[str] = set()
         for match in _PATH_PATTERN.finditer(command):
             token = match.group(0)
+            if _is_virtual_path(token):
+                continue
             path = Path(token)
             try:
                 resolved = path.resolve()

@@ -9,7 +9,9 @@
   决策先于副作用的原则）。
 
 本层是可注入的服务边界：
-- 默认 ConsoleAskService：CLI 里用 input() 交互；
+- ConsoleAskService：CLI 交互；注入 StdinDispatcher 后所有读取走统一
+  stdin 入口（后台线程独占 input() + 队列分发 + drain_pending），
+  避免主循环与审批抢同一行缓冲区（知识增量 5.3）；
 - 测试/嵌入方实现 AskService 注入即可（如脚本化回答、网页表单、MCP）。
 """
 from __future__ import annotations
@@ -17,6 +19,8 @@ from __future__ import annotations
 import asyncio
 from abc import ABC, abstractmethod
 from typing import Sequence
+
+from agent_test.human.stdin_dispatcher import StdinDispatcher
 
 # 批准回答的肯定集合（大小写不敏感）
 _YES = {"y", "yes", "1", "是", "同意", "批准", "继续"}
@@ -63,7 +67,34 @@ class AskService(ABC):
 
 
 class ConsoleAskService(AskService):
-    """CLI 交互实现：通过标准输入收集用户回答。"""
+    """CLI 交互实现：通过标准输入收集用户回答。
+
+    dispatcher（知识增量）：注入 StdinDispatcher 后，主循环 / 审批 /
+    ask_user 三条读取路径共用同一个后台读取线程，不再各自调用 input()；
+    缺省 None 时退化为 asyncio.to_thread(input)，仅适用于单一读取路径的
+    简单 CLI。
+
+    审批 / 提问前先 drain_pending()：排空队列里已缓冲的陈旧行，避免
+    用户在审批弹出前粘贴的多行文本被当成审批回答（自动批准/拒绝）。
+    """
+
+    def __init__(self, dispatcher: StdinDispatcher | None = None) -> None:
+        self._dispatcher = dispatcher
+
+    @property
+    def dispatcher(self) -> StdinDispatcher | None:
+        return self._dispatcher
+
+    def _drain_pending(self) -> None:
+        """审批/提问前排空陈旧输入（无 dispatcher 时为空操作）。"""
+        if self._dispatcher is not None:
+            self._dispatcher.drain_pending()
+
+    async def _read_line(self, prompt: str) -> str:
+        """统一 stdin 读取入口：分发器优先，否则线程化 input()。"""
+        if self._dispatcher is not None:
+            return await self._dispatcher.readline(prompt)
+        return await asyncio.to_thread(input, prompt)
 
     async def ask_user(
         self,
@@ -79,11 +110,11 @@ class ConsoleAskService(AskService):
         if options:
             lines.append("候选（可选编号，或直接输入其他内容）：")
             lines.append(_render_options(options))
+        self._drain_pending()
         print("\n".join(lines))
+        raw = await self._read_line("> ")
         if options:
-            raw = await asyncio.to_thread(input, "> ")
             return _resolve_choice(raw, options, multi_select)
-        raw = await asyncio.to_thread(input, "> ")
         return raw.strip() or "(用户未输入)"
 
     async def confirm(
@@ -96,7 +127,8 @@ class ConsoleAskService(AskService):
         if description:
             lines.append(f"  说明: {description}")
         lines.append("批准继续? (y/n): ")
-        raw = await asyncio.to_thread(input, "\n".join(lines))
+        self._drain_pending()
+        raw = await self._read_line("\n".join(lines))
         ok = _yes_no(raw)
         return ok, ("用户已批准" if ok else "用户拒绝")
 

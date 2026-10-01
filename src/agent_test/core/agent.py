@@ -15,6 +15,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from agent_test.core.inbox import InBox
@@ -28,7 +29,9 @@ from agent_test.session.session import Session
 from agent_test.tools import tool_center
 from agent_test.types.events import AgentPhase, EventType, Phase
 from agent_test.types.messages import (
+    ApprovalResult,
     AssistantMessage,
+    ExecutionResult,
     Message,
     TextBlock,
     ToolCallBlock,
@@ -233,6 +236,10 @@ class ReactAgent:
     async def _step(self) -> str:
         """执行一步：claim step 消息 -> 组装上下文 -> 调用 LLM -> 执行工具。
 
+        工具阶段分成两步（知识增量 5.1）：
+        - _pre_step：串行预检 + 串行审批（allowlist 级联依赖顺序）；
+        - _exec_one：asyncio.gather 并行执行（审批已结案，无副作用依赖）。
+
         返回 end_reason：''（需要继续工具循环）/ finish / max_token / error。
         """
         self.phase.step += 1
@@ -273,37 +280,16 @@ class ReactAgent:
                 if assistant_message is not None
                 else []
             )
-            # pre_step：整步工具调用先做一次“全量预检”。硬拒绝（DENY）
-            # 在副作用前拦截；REQUIRE_APPROVAL 在未配置 approver 时也
-            # 在此拦截，配置了 approver 则交由 ToolCenter 闸门交互审批
-            # （批准 -> 记住前缀 -> 执行；拒绝 -> 原因回传 LLM）。
-            decisions = self._pre_step(tool_calls)
-            for tc in tool_calls:
-                decision = decisions.get(tc.id)
-                blocked = decision is not None and (
-                    decision.action is PolicyAction.DENY
-                    or (
-                        decision.action is PolicyAction.REQUIRE_APPROVAL
-                        and getattr(self.tool_center, "approver", None)
-                        is None
-                    )
-                )
-                if blocked:
-                    result = {
-                        "content": decision.to_message(),
-                        "is_error": True,
-                        "blocked": True,
-                        "policy_action": decision.action.value,
-                    }
-                else:
-                    result = await self.tool_center.execute(
-                        tc.name, tc.args_dict
-                    )
-                tool_result = ToolResultMessage(
-                    tool_call_id=tc.id,
-                    content=[TextBlock(content=result["content"])],
-                    is_error=result["is_error"],
-                )
+            # ① 串行审批（pre_step）：对整步工具调用逐个决策 + 交互审批
+            #    —— allowlist 级联必须串行，且决策先于任何副作用；
+            #    批准 -> 记住前缀/越界路径/越界工作目录；拒绝 -> 原因回传 LLM。
+            decisions = await self._pre_step(tool_calls)
+            # 并行执行：审批已全部结案，放行的工具之间无副作用依赖，
+            # 用 asyncio.gather 并行执行（单工具异常不取消其他工具）。
+            tool_results = await asyncio.gather(
+                *[self._exec_one(tc, decisions.get(tc.id)) for tc in tool_calls]
+            )
+            for tool_result in tool_results:
                 self.inbox.append("step", tool_result)
 
             self.session.append(
@@ -354,42 +340,228 @@ class ReactAgent:
         无可压缩事件时降级二级全量；返回摘要文本或 None。"""
         return await self.compactor.compact()
 
-    def _pre_step(
+    async def _pre_step(
         self, tool_calls: list[ToolCallBlock]
     ) -> dict[str, PolicyDecision]:
-        """pre_step 阶段：对整步工具调用做统一预检。
+        """pre_step 阶段（异步）：对整步工具调用做串行预检 + 串行审批。
 
         预检只读、无副作用，返回 {tool_call_id: PolicyDecision}。
-        危险/工作目录/审批决策抽象在 agent_test.policy（跨工具复用），
-        bash 是首个接入的高危工具；ToolCenter.execute 内置同一策略作为
-        硬闸门。职责分工：
-        - DENY（破坏性/越界）：在 pre_step 直接拦截，决策先于任何副作用；
-        - REQUIRE_APPROVAL：未配置 approver 时在此拦截返回“需审批”；
-          配置了 approver 则放行到 ToolCenter 闸门做交互审批
-          （批准 -> 记住前缀 -> 执行；拒绝 -> 原因回传 LLM）。
+        审批必须串行：allowlist 级联依赖前一个审批结果更新策略状态
+        （批准 `pip install flask` 后 `pip install *` 不再打扰用户），
+        并发审批会重复弹窗；执行阶段才并行（见 _step / _exec_one）。
+
+        审批状态经 decision.detail（frozen dataclass 的可变 dict 字段）传递，
+        避免给 frozen 属性赋值触发 FrozenInstanceError：
+        - _resolved:          审批阶段是否已结案
+        - _approved:          是否放行执行
+        - _approval_decision: auto / approved / denied / blocked
+        - _approval_source:   policy / user / no_approver
+        - _denied_reason:     拒绝原因（随工具结果回传 LLM 供其调整方案）
+
+        职责分工：DENY（破坏性/越界）与「需审批但无审批服务」在此拦截，
+        决策先于任何副作用；批准后记住命令前缀与越界路径，供后续同类调用
+        自动放行（allowlist 级联）。
         """
         policy = getattr(self.tool_center, "policy", None)
+        approver = getattr(self.tool_center, "approver", None)
         decisions: dict[str, PolicyDecision] = {}
         for tc in tool_calls:
             if policy is None:
-                decisions[tc.id] = PolicyDecision(
+                decision = PolicyDecision(
                     action=PolicyAction.EXECUTE, tool_name=tc.name
                 )
-                continue
-            decisions[tc.id] = policy.decide_tool(tc.name, tc.args_dict)
-        for decision in decisions.values():
-            if decision.action is PolicyAction.DENY:
-                RuntimeLog.warning(
-                    "pre_step 拒绝 tool=%s reasons=%s",
-                    decision.tool_name,
-                    "; ".join(decision.reasons),
-                )
-            elif decision.action is PolicyAction.REQUIRE_APPROVAL:
-                RuntimeLog.info(
-                    "pre_step 需审批 tool=%s（待 ToolCenter/approver 处理）",
-                    decision.tool_name,
-                )
+            else:
+                decision = policy.decide_tool(tc.name, tc.args_dict)
+            detail = decision.detail if isinstance(decision.detail, dict) else {}
+            detail.setdefault("_resolved", True)
+            await _approve(decision, detail, tc, policy, approver)
+            decisions[tc.id] = decision
         return decisions
+
+    async def _exec_one(
+        self, tool_call: ToolCallBlock, decision: PolicyDecision | None
+    ) -> ToolResultMessage:
+        """执行单个工具调用（并行单元）。
+
+        审批前置：本方法不再询问用户——审批已在 _pre_step 串行完成，
+        这里只按审批结论放行或返回 blocked 结果；放行时把 decision 作为
+        pre_decision 传给 ToolCenter（跳过其重复决策，防二次审批）。
+        """
+        detail = (
+            decision.detail
+            if decision is not None and isinstance(decision.detail, dict)
+            else {}
+        )
+        try:
+            if decision is not None and not detail.get("_approved", True):
+                return self._blocked_tool_result(tool_call, decision, detail)
+            result = await self.tool_center.execute(
+                tool_call.name,
+                tool_call.args_dict,
+                pre_decision=decision,
+            )
+            return ToolResultMessage(
+                tool_call_id=tool_call.id,
+                content=[TextBlock(content=result["content"])],
+                is_error=result["is_error"],
+                approval=result.get("approval"),
+                execution=result.get("execution"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            # 单个工具失败不得取消其他并行工具（gather 语义），
+            # 也不得让异常逃逸出本步
+            summary = RuntimeLog.capture_exception(
+                exc,
+                location=f"ReactAgent._exec_one[tool={tool_call.name}]",
+                detail={"tool_call_id": tool_call.id},
+            )
+            return ToolResultMessage(
+                tool_call_id=tool_call.id,
+                content=[
+                    TextBlock(
+                        content=(
+                            f"工具执行失败: {summary['error_type']}: "
+                            f"{summary['message']}"
+                        )
+                    )
+                ],
+                is_error=True,
+                # 执行阶段报错：审批结论保持真实值（auto/approved），
+                # 失败只体现在 execution.status 上
+                approval=ApprovalResult(
+                    decision=str(detail.get("_approval_decision", "auto")),
+                    required=bool(
+                        decision is not None
+                        and decision.action is PolicyAction.REQUIRE_APPROVAL
+                    ),
+                    source=str(detail.get("_approval_source", "policy")),
+                    reason_code="execution_error",
+                    reason=(
+                        "; ".join(decision.reasons) if decision is not None else ""
+                    ),
+                ),
+                execution=ExecutionResult(
+                    status="failed", error=summary["message"]
+                ),
+            )
+
+    def _blocked_tool_result(
+        self,
+        tool_call: ToolCallBlock,
+        decision: PolicyDecision,
+        detail: dict,
+    ) -> ToolResultMessage:
+        """审批未放行：构造 blocked 结果（execution=not_started，无副作用）。"""
+        approval_decision = str(detail.get("_approval_decision", "blocked"))
+        denied_reason = str(detail.get("_denied_reason", ""))
+        source = str(detail.get("_approval_source", "policy"))
+        content = decision.to_message()
+        if approval_decision == "denied" and denied_reason:
+            content = f"审批被用户拒绝：{denied_reason}\n\n{content}"
+        if source == "no_approver":
+            reason_code = "no_approver"
+        elif approval_decision == "denied":
+            reason_code = "user_denied"
+        else:
+            reason_code = decision.action.value
+        return ToolResultMessage(
+            tool_call_id=tool_call.id,
+            content=[TextBlock(content=content)],
+            is_error=True,
+            approval=ApprovalResult(
+                decision=(
+                    "denied" if approval_decision == "denied" else "blocked"
+                ),
+                required=True,
+                source=source,
+                reason_code=reason_code,
+                reason=denied_reason or "; ".join(decision.reasons),
+            ),
+            execution=ExecutionResult(
+                status="not_started", error=denied_reason
+            ),
+        )
+
+
+async def _approve(
+    decision: PolicyDecision,
+    detail: dict,
+    tool_call: ToolCallBlock,
+    policy,
+    approver,
+) -> None:
+    """串行审批核心：把审批结论写入 decision.detail。
+
+    四种分支（对应审批状态机）：
+    - DENY                       -> blocked（策略直接拦截）
+    - REQUIRE_APPROVAL / 无审批服务 -> blocked（no_approver）
+    - REQUIRE_APPROVAL / 有审批服务 -> denied / approved（用户决定，
+      批准后记住命令前缀、越界路径与越界工作目录，实现 allowlist 级联）
+    - EXECUTE                    -> auto（策略自动放行）
+
+    串行性：本函数在 _pre_step 中按 tool_calls 顺序 await，前一个审批的
+    结果（allowlist / allowed_roots 更新）对后一个决策立即生效。
+    """
+    if decision.action is PolicyAction.DENY:
+        detail["_approved"] = False
+        detail["_approval_decision"] = "blocked"
+        detail["_approval_source"] = "policy"
+        detail["_denied_reason"] = "; ".join(decision.reasons)
+        RuntimeLog.warning(
+            "pre_step 拒绝 tool=%s reasons=%s",
+            decision.tool_name,
+            "; ".join(decision.reasons),
+        )
+        return
+
+    if decision.action is not PolicyAction.REQUIRE_APPROVAL:
+        detail["_approved"] = True
+        detail["_approval_decision"] = "auto"
+        detail["_approval_source"] = "policy"
+        detail["_denied_reason"] = ""
+        return
+
+    if approver is None:
+        detail["_approved"] = False
+        detail["_approval_decision"] = "blocked"
+        detail["_approval_source"] = "no_approver"
+        detail["_denied_reason"] = "未配置审批服务，已阻断执行"
+        RuntimeLog.info(
+            "pre_step 需审批（未配置 approver）tool=%s", decision.tool_name
+        )
+        return
+
+    command = str(detail.get("command", ""))
+    approved, message = await approver.confirm(
+        action=(
+            f"执行命令: {command}"
+            if command
+            else f"执行工具 {tool_call.name}"
+        ),
+        description="; ".join(decision.reasons),
+    )
+    detail["_approval_source"] = "user"
+    if not approved:
+        detail["_approved"] = False
+        detail["_approval_decision"] = "denied"
+        detail["_denied_reason"] = message
+        RuntimeLog.warning(
+            "pre_step 审批被用户拒绝 tool=%s reason=%s",
+            decision.tool_name,
+            message,
+        )
+        return
+    detail["_approved"] = True
+    detail["_approval_decision"] = "approved"
+    detail["_denied_reason"] = ""
+    if policy is not None:
+        policy.remember_approval(command, detail)
+    RuntimeLog.info(
+        "pre_step 审批通过并记住前缀/路径/工作目录 tool=%s outside_workdir=%s command=%s",
+        decision.tool_name,
+        detail.get("outside_workdir") or "",
+        command[:300],
+    )
 
 
 def create_agent(

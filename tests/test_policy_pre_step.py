@@ -105,15 +105,49 @@ def test_cwd_detection_missing_dir(tmp_path):
     assert "工作目录检测失败" in decision.reasons[0]
 
 
-def test_cwd_detection_outside_workspace(tmp_path):
+def test_cwd_detection_outside_workspace_requires_approval(tmp_path):
+    """越界工作目录是可审批项（目录本身存在可用），不是不可审批的参数错误。"""
     outside = tmp_path.parent / f"{tmp_path.name}-outside"
     outside.mkdir(exist_ok=True)
     policy = CommandPolicy(allowed_roots=[tmp_path])
     decision = policy.decide(
         "echo hi", workdir=str(outside), default_cwd=tmp_path
     )
-    assert decision.action is PolicyAction.DENY
+    assert decision.action is PolicyAction.REQUIRE_APPROVAL
     assert "超出允许工作区" in decision.reasons[0]
+    assert decision.detail["outside_workdir"] == str(outside.resolve())
+
+
+def test_outside_workdir_remembered_after_approval(tmp_path):
+    """批准越界工作目录后记入允许根：同一目录不再逐条审批。"""
+    outside = tmp_path.parent / f"{tmp_path.name}-outside2"
+    outside.mkdir(exist_ok=True)
+    policy = CommandPolicy(allowed_roots=[tmp_path])
+    assert (
+        policy.decide("echo hi", workdir=str(outside)).action
+        is PolicyAction.REQUIRE_APPROVAL
+    )
+    assert policy.add_allowed_root(outside) is True
+    assert (
+        policy.decide("echo hi", workdir=str(outside)).action
+        is PolicyAction.EXECUTE
+    ), "同一越界目录批准一次后不再审批"
+
+
+def test_remember_approval_covers_prefix_and_workdir(tmp_path):
+    """审批记忆统一入口：命令前缀 + 越界路径 + 越界工作目录一次记住。"""
+    outside = tmp_path.parent / f"{tmp_path.name}-outside3"
+    outside.mkdir(exist_ok=True)
+    policy = CommandPolicy(allowed_roots=[tmp_path])
+    decision = policy.decide("git push origin main", workdir=str(outside))
+    assert decision.action is PolicyAction.REQUIRE_APPROVAL
+
+    policy.remember_approval("git push origin main", decision.detail)
+
+    assert (
+        policy.decide("git push origin dev", workdir=str(outside)).action
+        is PolicyAction.EXECUTE
+    )
 
 
 def test_cwd_relative_to_default(tmp_path):

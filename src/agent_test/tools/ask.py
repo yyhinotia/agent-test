@@ -99,8 +99,10 @@ def register_ask(
     )(ask_user)
     center.register(
         desc=(
-            "用户审批工具：在执行影响面较大的动作（删除/提交/继续）前"
-            "请用户批准；返回 approved 或 denied 及原因"
+            "用户审批工具：在**不经过 bash 工具**的影响面较大动作前请用户"
+            "批准；返回 approved 或 denied 及原因。注意：bash 命令不要调用"
+            "本工具——策略闸门会在执行前自动弹审批，重复调用会让用户对同一"
+            "条命令回答两次"
         ),
         parameters=_CONFIRM_PARAMETERS,
         required=["action"],

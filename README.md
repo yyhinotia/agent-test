@@ -16,8 +16,11 @@ agent-test/
 ├── uv.lock                     # uv 生成的锁定文件（由 uv sync 生成）
 ├── .env.example                # 环境变量示例（复制为 .env 后填写）
 ├── conftest.py                 # pytest 根配置（测试间隔离运行时日志）
-├── scripts/                    # 运维脚本
-│   └── start-llama-qwen.ps1    # 本地 Qwen 小模型一键启动（llama.cpp + OpenAI 兼容）
+├── scripts/                    # 运维与验收脚本
+│   ├── start-llama-qwen.ps1    # 本地 Qwen 小模型一键启动（llama.cpp + OpenAI 兼容）
+│   ├── start-qwen25-3b.ps1     # 3B 模型（默认端口 8081，ctx 16384）
+│   ├── start-qwen25-7b.ps1     # 7B 模型（3060 6GB 量化）
+│   └── audit_session.py        # 会话审计：JSONL + runtime.log -> 可机械判定的报告
 ├── src/agent_test/             # 主包：按功能模块组织
 │   ├── exceptions/             # 异常体系（AgentBaseError 基类 + 分类异常）
 │   │   ├── base.py             #   AgentBaseError（业务异常统一基类）
@@ -32,7 +35,8 @@ agent-test/
 │   │   ├── events.py           #   EventType/Phase/SessionEvent（turn/step/compacted + COMPACT 摘要事件）
 │   │   └── tools.py            #   ToolSchema / ToolCenterSchema
 │   ├── core/                   # 核心执行
-│   │   ├── agent.py            #   ReactAgent（依赖注入 + inbox.step 消息流 + TokenMeter/Compactor 压缩）
+│   │   ├── agent.py            #   ReactAgent（inbox.step 消息流 + 串行审批 + 并行执行 + 压缩）
+│   │   ├── prompts.py          #   结构化系统提示词（平台感知环境检查 + shell 硬性规则 + 状态语义）
 │   │   └── inbox.py            #   InBox 消息队列（turn/step 分区，per-Agent 私有）
 │   ├── session/                # 会话
 │   │   └── session.py          #   Session（持久化游标 + 压缩打标/摘要插入 + from_file 校验）
@@ -42,16 +46,21 @@ agent-test/
 │   │   ├── compactor.py        #   Compactor：按 turn 分块两级压缩（摘要化历史回合）
 │   │   └── registry.py         #   LLM_CLIENT 注册表（懒构建）
 │   ├── tools/                  # 工具
-│   │   ├── center.py           #   ToolCenter（注册/执行/策略闸门/approver，错误降级为结果）
+│   │   ├── center.py           #   ToolCenter（注册/执行/pre_decision 旁路/审批+执行双状态机）
 │   │   ├── builtin.py          #   内置文件工具 + bash + ask_user + tool_center 单例
-│   │   ├── bash.py             #   bash 命令执行工具（stdout/stderr/退出码/超时）
+│   │   ├── bash.py             #   bash 执行（回显/退出码/超时 + stdin 隔离 + 平台感知解码）
 │   │   └── ask.py              #   ask_user/confirm 用户交互工具注册（接 AskService）
 │   ├── policy/                 # 命令治理（pre_step 拦截，跨工具复用）
 │   │   ├── policy.py           #   CommandPolicy：allowlist+规则+越界 -> 决策
 │   │   ├── rules.py            #   命令风险静态检测（deny/approve/warn）
 │   │   └── cwd.py              #   工作目录解析与工作区越界检测
 │   ├── human/                  # 用户交互（Human-in-the-Loop）
-│   │   └── service.py          #   AskService / ConsoleAskService（澄清/补充/批准）
+│   │   ├── service.py          #   AskService / ConsoleAskService（澄清/补充/批准/统一读取入口）
+│   │   └── stdin_dispatcher.py #   StdinDispatcher（后台线程独占 input() + 队列 + drain_policy）
+│   ├── app/                    # CLI 应用（交互式入口）
+│   │   ├── application.py      #   Application：主循环/多行续行/去重/依赖装配
+│   │   ├── cli_ask_service.py  #   CLIAskService：审批 + 审计日志 + EOF 降级
+│   │   └── __main__.py         #   python -m agent_test.app 入口
 │   └── utils.py                # get_uuid / get_now
 ├── tests/                      # pytest 测试（本地离线）
 │   ├── test_core.py            # 核心组件冒烟测试（含 FakeLLM 驱动完整 ReAct 循环）
@@ -63,13 +72,56 @@ agent-test/
 │   ├── test_session_error_event.py  # 错误事实进 session、堆栈进日志的端到端测试
 │   ├── test_ask_user_tool.py        # ask_user/confirm 与批准继续（approver）测试
 │   ├── test_policy_pre_step.py      # 命令治理：风险/工作目录/审批与 pre_step 拦截
+│   ├── test_approval_parallel.py     # 串行审批+并行执行/双状态机/pre_decision 旁路
+│   ├── test_stdin_dispatcher.py      # 统一 stdin 分发器/排空陈旧输入/EOF 降级
 │   ├── test_token_meter.py          # TokenMeter：阈值/覆盖式赋值/reset/窗口 10000
 │   ├── test_compact.py              # Compactor：分块/二级降级 + 窗口 10000 端到端压缩
-│   └── test_bash_tool.py            # bash 执行层：回显/退出码/工作目录/超时
+│   ├── test_bash_tool.py            # bash 执行层：回显/退出码/工作目录/超时/平台感知编码
+│   ├── test_create_agent.py         # create_agent 生命周期工厂（新建/拒绝覆盖/resume）
+│   ├── test_session_reload.py       # 窗口化重载 + turn/step 编号续接
+│   ├── test_session_torn_tail.py     # 尾部残行的容错与清理
+│   └── test_audit_session.py         # 审计脚本判定（`;` 只在引号外算违规）
+├── docs/                       # 设计与验收文档
+│   ├── architecture-evolution.md     # 架构演进对照分析
+│   └── hitl-tool-design-research.md  # HITL（澄清 / 审批）设计调研
 ├── sessions/                   # 运行时生成：{session_id}.jsonl（会话事件，gitignore）
 └── logs/                       # 运行时生成：runtime.log（完整日志，gitignore）
 ```
 
+
+## 架构总览（一次 turn 的完整链路）
+
+```text
+用户输入 ──> inbox.turn ──> turn/start
+                             │
+                             ├─ step 循环（直到 end_reason 非空）
+                             │    ├─ session.derive_messages() ──> llm.stream()
+                             │    │    三元组：assistant / end_reason / usage
+                             │    ├─ TokenMeter 超阈值 ──> Compactor 压缩
+                             │    │    旧事件打标 + compact/summary 进上下文窗口
+                             │    ├─ 工具阶段两段分离（知识增量 5.1）
+                             │    │    ① _pre_step 串行：decide_tool -> 审批
+                             │    │      批准 -> 记住前缀 / 越界路径 / 越界工作目录
+                             │    │      拒绝或拦截 -> execution=not_started（零副作用）
+                             │    │    ② _exec_one 并行：asyncio.gather 执行已放行工具
+                             │    └─ 结果先入 inbox.step，由下一步 claim 落 session
+                             └─> turn/end(reason)
+```
+
+四条不变式（细节见下文各节）：
+
+- **审批先于执行**：整步工具调用先做全量预检 + 审批，再并行执行；被拒 / 被拦截的
+  动作标记 `execution=not_started`，从未产生副作用；
+- **双状态机**：`ApprovalResult`（auto / approved / denied / blocked）与
+  `ExecutionResult`（not_started / success / failed）分离，避免把「用户拒绝」
+  误读成「执行失败」而反复重试；
+- **单点闸门**：`ToolCenter.execute` 是任何执行入口的安全兜底；`pre_decision`
+  旁路与独立决策互斥，既防绕过审批、也防二次审批；
+- **可回放**：错误事实（location / error_type / message）进 session，完整堆栈进
+  `logs/runtime.log`；会话 JSONL + 日志可由 `scripts/audit_session.py` 机械判定。
+
+平台感知贯穿提示词与工具层：系统提示词按当前平台生成首选的**环境检查命令**，
+`bash` 的输出编码按**控制台代码页**自动适配（见下文对应小节）。
 
 ## 本地小模型一键启动与测试（Qwen2.5-0.5B-Instruct）
 
@@ -107,12 +159,19 @@ uv sync
 copy .env.example .env
 # 填写 API_KEY / BASE_URI / MODEL_NAME
 
-# 4. 运行（每次运行自动生成 sessions/{session_id}.jsonl 与 logs/runtime.log）
+# 4. 单轮演示（每次运行自动生成 sessions/{session_id}.jsonl 与 logs/runtime.log）
 uv run python main.py "你好，请介绍一下你自己"
 uv run python main.py "请读取 E:\\workspace\\agent-test\\README.md 的前 30 行"
 
-# 5. 跑测试
+# 5. 交互式 CLI（多轮会话 + 串行审批 + 统一 stdin）
+uv run python -m agent_test.app
+uv run python -m agent_test.app -r --session-id <session_id>   # 续聊
+
+# 6. 跑测试
 uv run pytest -v
+
+# 7. 增量验收：逐条跑交互式用例后，用审计脚本机械判定会话（见「增量验收」一节）
+uv run python scripts/audit_session.py sessions/<session_id>.jsonl --log logs/runtime.log
 ```
 
 ## 日志与异常设计（本次重构核心）
@@ -161,8 +220,12 @@ finally:
 ### bash 工具（`agent_test.tools.bash`）
 
 - 入参：`command`（必填）、`workdir`、`timeout`、`encoding`、`max_output_chars`；
-- 返回：`{command, cwd, exit_code, stdout, stderr, timed_out, truncated}` ——
-  `stdout` 为成功回显、`stderr` 为 err 回显，二者分开返回并附退出码；
+- **平台感知解码**：`encoding` 缺省按平台自动选——POSIX 用 `utf-8`，Windows 取
+  **控制台输出代码页**（`chcp 65001` -> `utf-8`，默认中文控制台 -> `cp936`/`gbk`）；
+  自动模式下若首选解码出现替换字符则按候选兜底，避免「GBK 回显按 UTF-8 解码」或
+  反过来变成一串 `\ufffd`；显式传 `encoding=` 即以参数为准；
+- 返回：`{command, cwd, exit_code, encoding, stdout, stderr, timed_out, truncated}` ——
+  `stdout` 为成功回显、`stderr` 为 err 回显，二者分开返回并附退出码与本次实际使用的解码编码；
 - 跨平台：Windows 走 `cmd.exe`（COMSPEC）、POSIX 走 `/bin/sh`，工具名叫
   bash、语义是“执行一条命令”；
 - 异步执行：`asyncio.create_subprocess_shell`，不阻塞 agent 事件循环，
@@ -198,13 +261,17 @@ bash 是第一个接入的高危工具；后续工具只需在 `CommandPolicy.de
 ### 决策流程（`CommandPolicy.decide`）
 
 1. **工作目录检测**（`policy/cwd.py`）：解析 workdir（缺省取默认目录）→ 必须
-   存在且为目录 → 真实路径必须位于 `allowed_roots` 允许工作区内（越界 DENY）；
+   存在且为目录 → 真实路径必须位于 `allowed_roots` 允许工作区内。不存在 /
+   不是目录属**不可审批的参数错误**（DENY）；「超出允许工作区」属**可审批项**
+   （`CwdCheck.outside=True` → REQUIRE_APPROVAL），批准后经
+   `CommandPolicy.add_allowed_root` 记入允许根，本会话内同一目录不再逐条打扰；
 2. **已审批前缀 allowlist**：命令头部命中（如 `["git", "push"]`）直接放行；
 3. **静态风险检测**（`policy/rules.py`）：正则三档命中 ——
    `deny`（rm -rf / del /s /q / Remove-Item / format / diskpart 等，直接拒绝）、
    `approve`（git push / reset --hard / 安装 / 网络 / 注册表 / 服务变更，需审批）、
    `warn`（提示性）；
-4. **工作区外路径检测**：命令涉及允许工作区之外的绝对路径，保守地至少要求审批。
+4. **越界检测**：命令涉及允许工作区之外的绝对路径，或 workdir 指向允许工作区
+   之外的目录，都保守地至少要求审批（两种越界共用「批准即记忆」语义）。
 
 默认单例 `tool_center` 挂载 `CommandPolicy(allowed_roots=[Path.cwd()])`
 （进程启动目录即沙箱工作区）；需要更宽松/更严格边界时自行构造
@@ -261,10 +328,100 @@ register_bash(center)
 agent = ReactAgent(tools=center, llm_client=...)
 ```
 
-- 策略决策 `REQUIRE_APPROVAL`（如 git push）：**批准 -> `add_allowlist_for_command`
-  记住前缀（会话级，同类不再打扰）-> 执行**；**拒绝 -> 原因回传 LLM** 调整方案；
-- `DENY`（破坏性/越界）仍在 `ReactAgent._pre_step` 硬拦截，决策先于任何副作用；
+- 策略决策 `REQUIRE_APPROVAL`（如 git push、工作区外路径、越界 workdir）：
+  **批准 -> `CommandPolicy.remember_approval` 记住命令前缀 / 越界路径 / 越界工作目录
+  （会话级，同类不再打扰）-> 执行**；**拒绝 -> 原因回传 LLM** 调整方案；
+- `DENY`（破坏性命令、不存在的 workdir 等不可审批项）仍在 `ReactAgent._pre_step`
+  硬拦截，决策先于任何副作用；
 - 未配置 `approver` 时行为不变：直接返回“需要审批”的 is_error 结果。
+
+## CLI 应用与审批/执行两阶段（知识增量 2026-09-30）
+
+### 串行审批 + 并行执行（两阶段分离）
+
+`ReactAgent._step` 把工具阶段拆成两步：
+
+1. `_pre_step`（**串行**）：逐个 `policy.decide_tool` + `approver.confirm`。
+   allowlist 级联依赖顺序（批准 `git push` 后同类命令不再询问），所以审批
+   必须串行；审批结论写入 `decision.detail`（frozen dataclass 的可变 dict
+   字段，避免 `FrozenInstanceError`）：`_approved` / `_approval_decision` /
+   `_approval_source` / `_denied_reason`；
+2. `_exec_one`（**并行**）：`asyncio.gather` 并行执行已放行的工具；被拒/
+   被拦截的直接返回 blocked 结果，不进入执行层（没有任何副作用）。
+
+单工具异常不取消其他工具：`_exec_one` 内部 try/except 兜底，降级为
+`execution=failed` 的工具结果。
+
+### 双状态机：ApprovalResult / ExecutionResult
+
+| 审批 decision | 执行 status | 语义 |
+| --- | --- | --- |
+| `auto` / `approved` | `success` / `failed` | 已执行 |
+| `denied` | `not_started` | 用户拒绝，**从未执行** |
+| `blocked` | `not_started` | 策略拦截，**从未执行** |
+
+- `ToolResultMessage.approval` / `.execution` 为可选字段（旧 JSONL 缺省
+  `None`）；`is_error` 保留向后兼容，等价于
+  `execution.status != "success"`；
+- LLM 适配器把两者渲染成标签行（`[审批:用户拒绝执行](user_denied)`、
+  `[执行:未开始(审批未通过)]`），压缩器同样保留该语义 —— 不把“审批被拒”
+  压缩成普通“执行失败”。
+
+### `pre_decision` 旁路与安全兜底
+
+`ToolCenter.execute(..., pre_decision=...)`：
+
+- **传入**（Agent 路径）：跳过本层重复决策 —— 与“独立决策”互斥，避免二次审批；
+- **不传**（任何直接 execute 入口）：本层自行做完整策略决策，硬闸门始终
+  生效，防止绕过。
+
+### 交互式 CLI（`python -m agent_test.app`）
+
+```bash
+uv run python -m agent_test.app                        # 新建会话
+uv run python -m agent_test.app -r --session-id s-1    # 窗口化重载续聊
+uv run python -m agent_test.app --allowed-root E:/workspace
+uv run python -m agent_test.app --drain-policy never   # 脚本化运行（管道喂输入）
+```
+
+- `/exit` 或 Ctrl-D 退出；行尾 `\` 续行，**一行 = 一个回合**（整块粘贴会被
+  拆成多个独立请求），连续重复输入自动去重；
+- **统一 stdin**：主循环 / 审批 / `ask_user` 三条读取路径都走
+  `StdinDispatcher` —— 一个后台 daemon 线程独占 `input()` + `asyncio.Queue`
+  分发，审批与提问前先 `drain_pending()` 排空陈旧缓冲行，解决“审批弹出前
+  粘贴的多行文本被当作审批回答”的竞争问题；**排空策略可配**
+  `--drain-policy auto|always|never`：`auto`（缺省）只在交互终端排空，
+  管道 / 重定向（脚本化运行）下不排空，否则会把脚本自己的行（含 `y`/`n`
+  回答）吞掉；后台线程无法优雅停止（`input()` 阻塞），随进程退出；
+- 子进程（bash）以 `stdin=asyncio.subprocess.DEVNULL` 启动，不继承父进程
+  终端；超时 kill 后再套一层 `wait_for(communicate, timeout=5)`，避免挂死。
+
+### 结构化系统提示词（`core/prompts.py`）
+
+`LLMBaseAdapter` 缺省注入结构化提示词（可用 `system_prompt=` 覆盖）：
+
+- 首轮环境检查（`uname -s && pwd && python --version && git --version`）；
+- Git Bash / cmd 语法对照表；
+- `;` 硬性禁令 + 3 个错误示例（会话分析显示软性建议无效，必须升级为硬规则）；
+- Windows 路径规范（正斜杠 / 引号）；
+- 审批/执行标签语义，以及要求把环境与审批信息写入 Critical Context
+  （压缩后仍可复用）。
+
+### 增量验收（会话审计脚本）
+
+- 验收方式：逐条跑交互式用例，每个用例一个独立 `--session-id`、提示词**写成单行**
+  （CLI 只在行尾 `\` 时续行，整块粘贴会被拆成多个回合），跑完再用审计脚本判定；
+- `scripts/audit_session.py`：把会话 JSONL + `logs/runtime.log` 变成可机械判定的报告
+  —— 审批 x 执行组合合法性、批次规模与 bash 并发峰值、allowlist 级联、`;` 违规、
+  被拒命令是否被重发、压缩与环境信息保留，以及实战新增的启动目录告警、环境检查
+  重复、重复 confirm、EOF 降级与疑似跨两次启动；`--digest` 还能按回合回放
+  「用户 / 工具调用 / 审批执行状态」。
+
+```powershell
+# 必须从仓库根启动，否则 sessions/ logs/ 临时文件会落进 src/agent_test/app/
+& .\.venv\Scripts\python.exe -m agent_test.app --session-id t3-states
+& .\.venv\Scripts\python.exe scripts\audit_session.py sessions\t3-states.jsonl --log logs\runtime.log --digest
+```
 
 ## 会话持久化（Session + JSONL）
 
@@ -333,6 +490,9 @@ agent2 = create_agent(agent.session.session_id, resume=True)
   消息与工具结果**先入 `inbox.step` 队列**，由下一步的 pre_step claim 或
   回合收尾统一写 session -> TokenMeter 按 usage 阈值检测，超阈值触发
   Compactor 压缩 -> 返回 end_reason（'' / finish / max_token / error）；
+- **工具阶段两段分离**（详见「CLI 应用与审批/执行两阶段」）：`_pre_step` 串行
+  完成策略决策与交互审批（allowlist 级联依赖顺序，必须串行），`_exec_one`
+  用 `asyncio.gather` 并行执行已放行的工具，单工具异常不取消同批其他工具；
 - **错误统一处理**：`ReactAgent._step` 捕获任何异常 -> 完整堆栈写入日志
   文件 -> location/error_type/message 摘要写入 session 的 runtime/error 事件。
 
