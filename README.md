@@ -92,7 +92,6 @@ agent-test/
 ├── pyproject.toml / uv.lock      # 依赖与锁文件
 ├── .env.example                  # 环境变量示例
 ├── conftest.py                   # pytest 隔离（日志/NO_PROXY）
-├── HANDOFF.md                    # 交接文档
 ├── scripts/
 │   ├── audit_session.py          # 会话审计（审批/执行/压缩等机械判定）
 │   └── start-*.ps1               # 可选：本地 llama.cpp + Qwen 启动脚本
@@ -522,6 +521,5 @@ uv run pytest -q
 
 ## 12. 相关文档
 
-- `HANDOFF.md`：当前状态、测试基线、已知限制与后续建议；
 - `tasks/replan-chain/README.md`：重规划示例任务的运行方式与判定证据；
 - `scripts/audit_session.py`：会话审计与机械判定工具。
