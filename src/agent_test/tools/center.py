@@ -5,7 +5,7 @@
 - 错误事实通过返回的 {"content": str, "is_error": True} 进入
   tool/result 事件，供 LLM 与回放使用。
 
-知识增量（双状态机 + pre_decision）：
+双状态机与 pre_decision：
 - 返回值除 content/is_error 外还带 approval（ApprovalResult）与
   execution（ExecutionResult）——审批回答“是否允许执行”，执行回答
   “执行结果如何”，not_started 用于区分“审批被拒”与“执行失败”；
@@ -15,10 +15,11 @@
 """
 from __future__ import annotations
 
+import copy
 import inspect
 import json
 import logging
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Set
 
 from agent_test.exceptions.tools import ToolExecutionError
 from agent_test.log.runtime_log import RuntimeLog
@@ -102,6 +103,42 @@ class ToolCenter:
             return
         self.tools[tool_name].usable = False
 
+    def clone(
+        self,
+        *,
+        exclude: Set[str] | None = None,
+        include: Set[str] | None = None,
+    ) -> "ToolCenter":
+        """复制工具中心，用于派生子 Agent / 节点 Agent 的隔离执行。
+
+        - `exclude`：彻底从新字典中移除（断开
+          工具闭包对源 Agent 的引用链，避免循环引用）；
+        - `include`：只保留指定工具名（tool_scope 收缩）；
+        - `policy` 深拷贝（审批记忆/allowlist 不串台），`approver` 共享；
+        - 工具 schema 深拷贝，函数对象共享（函数本身无状态）。
+        """
+        excluded = set(exclude or ())
+        included = set(include) if include is not None else None
+        try:
+            cloned_policy = copy.deepcopy(self.policy)
+        except Exception:  # noqa: BLE001 - 自定义策略可能持有不可拷贝对象
+            cloned_policy = self.policy
+        cloned = ToolCenter(
+            policy=cloned_policy,
+            approver=self.approver,
+        )
+        for name, item in self.tools.items():
+            if name in excluded:
+                continue
+            if included is not None and name not in included:
+                continue
+            cloned.tools[name] = ToolCenterSchema(
+                tool_schema=item.tool_schema.model_copy(deep=True),
+                func=item.func,
+                usable=item.usable,
+            )
+        return cloned
+
     def get_schemas(self) -> List[Dict[str, Any]] | None:
         """获取全部可用工具的 OpenAI function calling schema。"""
         schemas = []
@@ -124,7 +161,7 @@ class ToolCenter:
               "execution": ExecutionResult, "blocked": bool, "policy_action": str}；
         is_error 保留向后兼容（等价于 execution.status != "success"）。
 
-        pre_decision（知识增量）：Agent 的 pre_step 串行审批结论。
+        pre_decision：Agent 的 pre_step 串行审批结论。
           - None：本方法自行做完整策略决策 —— 安全兜底：即使 Agent 已完成
             preflight，任何直接 execute 入口仍受管控，防绕过；
           - 传入：跳过重复决策（pre_decision 与独立决策互斥，避免二次

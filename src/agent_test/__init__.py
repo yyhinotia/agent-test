@@ -14,8 +14,10 @@
 """
 from agent_test.core.agent import ReactAgent, create_agent
 from agent_test.core.inbox import InBox
+from agent_test.core.plan_service import PlanService
 from agent_test.policy import CommandPolicy, PolicyAction, PolicyDecision
 from agent_test.tools.bash import bash, register_bash
+from agent_test.tools.subagent import register_span, register_subagent
 from agent_test.exceptions import (
     AgentBaseError,
     LlmError,
@@ -24,7 +26,11 @@ from agent_test.exceptions import (
     SessionEditError,
     ToolExecutionError,
 )
-from agent_test.human.service import AskService, ConsoleAskService
+from agent_test.human.service import (
+    AskService,
+    AutoApproveService,
+    ConsoleAskService,
+)
 from agent_test.human.stdin_dispatcher import StdinDispatcher
 from agent_test.llm.compactor import Compactor
 from agent_test.llm.token_meter import TokenMeter
@@ -41,17 +47,31 @@ from agent_test.types.messages import (
     ToolResultMessage,
     UserMessage,
 )
+from agent_test.types.plans import Plan, PlanStatus, PlanStep, StepStatus
 from agent_test.types.tools import ToolCenterSchema, ToolSchema
+from agent_test.app.scheduler import (
+    CheckpointRecord,
+    GraphState,
+    NodeState,
+    NodeStatus,
+    PAEPhase,
+    PAEState,
+    Scheduler,
+    StepResult,
+    TaskDAG,
+    TaskNode,
+)
 from agent_test.app.application import Application, main
 from agent_test.app.cli_ask_service import CLIAskService
 
-__version__ = "0.5.1"
+__version__ = "0.6.0"
 
 __all__ = [
     "AgentBaseError",
     "Application",
     "ApprovalResult",
     "AskService",
+    "AutoApproveService",
     "CLIAskService",
     "ConsoleAskService",
     "ExecutionResult",
@@ -62,6 +82,8 @@ __all__ = [
     "PolicyDecision",
     "bash",
     "register_bash",
+    "register_span",
+    "register_subagent",
     "AgentPhase",
     "AssistantMessage",
     "Compactor",
@@ -85,4 +107,19 @@ __all__ = [
     "ToolResultMessage",
     "ToolSchema",
     "UserMessage",
+    "Plan",
+    "PlanService",
+    "PlanStatus",
+    "PlanStep",
+    "StepStatus",
+    "Scheduler",
+    "TaskDAG",
+    "TaskNode",
+    "StepResult",
+    "NodeState",
+    "NodeStatus",
+    "GraphState",
+    "CheckpointRecord",
+    "PAEPhase",
+    "PAEState",
 ]

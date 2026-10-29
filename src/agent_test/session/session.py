@@ -1,15 +1,15 @@
 """会话与执行事件记录（含错误事件与持久化游标）。
 
-设计要点（重构后 + 知识增量）
-------------------------------
+设计要点
+--------
 - **持久化游标**：append 的 seq 使用自维护的 `_seq` 游标，不再依赖
   `len(self.events)`，保证 from_file 恢复后继续追加的事件序号连续；
 - **错误事件**：`append_error` 只记录错误“事实” —— 执行位置 + 报错类型
   + 消息摘要（runtime/error 事件），完整堆栈由 RuntimeLog 写入日志文件，
   二者通过 session_id 关联，既满足回放需求又不污染会话正文；
 - **连续性校验**：from_file 恢复时按「seq 集合校验」`sorted(seqs) == range(N)`
-  检查事件序号是否恰好为 0..N-1（知识增量）；
-- **事件唯一事实源**：事件携带 turn/step/compacted 元数据（知识增量）：
+  检查事件序号是否恰好为 0..N-1；
+- **事件唯一事实源**：事件携带 turn/step/compacted 元数据：
   - Compactor 按 turn 分块，把历史回合摘要化为 compact/summary 事件；
   - derive_messages 跳过 compacted=True 事件，并把 COMPACT 事件的
     data(str) 包装为 UserMessage 重新进入上下文；
@@ -20,11 +20,16 @@
   compact/summary 事件即停止（含该事件），只把「摘要 + 摘要之后的事件」
   载入 `events`（续聊所需的最小上下文窗口）；被跳过的磁盘前缀不载入
   内存但记账为 `_prefix_events`，`_persist_all` 重写时按行回填，保证
-  磁盘仍是全量历史（知识增量）。
+  磁盘仍是全量历史。
 - **残缺尾部容错**：恢复（from_file / reload）时，末尾无换行结尾
   且解析失败的行视为「写一半」（上次写入被截断）：记告警、跳过
   并清理磁盘残片；中间行损坏仍抛 SessionEditError。append 前
   也会先清掉残片，避免新事件与残片拼成无法解析的行。
+- **纯内存模式**（span/subagent 与 DAG 节点 Agent）：
+  `persist=False` 时不创建目录/文件，事件只保存在 `events` 中；
+  `append` / `_persist_all` / `_rewrite_with_prefix` 全部短路，
+  `reload` 走 `_reload_memory`，`destroy` 清空内存引用。一次性
+  Agent 因此没有磁盘 I/O，也不需要 resume。
 """
 from __future__ import annotations
 
@@ -115,17 +120,29 @@ def _file_ends_with_newline(path: Path) -> bool:
 
 
 class Session:
-    """会话事件记录，附带 JSONL 文件持久化。"""
+    """会话事件记录，附带 JSONL 文件持久化（可选纯内存模式）。"""
 
     def __init__(
-        self, session_id: str | None = None, persist_dir: str = "sessions"
+        self,
+        session_id: str | None = None,
+        persist_dir: str = "sessions",
+        *,
+        persist: bool = True,
+        session_file: str | Path | None = None,
     ):
-        """创建会话，并自动生成 {session_id}.jsonl 持久化文件（默认目录 sessions/）。"""
+        """创建会话。
+
+        persist=True（默认）：
+        - 未传 `session_file` 时沿用历史扁平路径
+          `{persist_dir}/{session_id}.jsonl`；
+        - 传 `session_file` 时使用该完整路径（例如
+          `.agent-test/sessions/{session_id}/session.jsonl`，或
+          `.agent-test/sessions/{graph_id}/{node_session_id}.jsonl`）。
+        persist=False：纯内存模式，`persist_dir` / `session_dir` / `file_path`
+        均为 None，事件只保存在 `events` 中。
+        """
+        self.persist = persist
         self.session_id = session_id or get_uuid()
-        self.persist_dir = Path(persist_dir)
-        self.file_path = self.persist_dir / f"{self.session_id}.jsonl"
-        self.persist_dir.mkdir(parents=True, exist_ok=True)
-        self.file_path.touch(exist_ok=True)  # 自动创建持久化文件
         self.events: List[SessionEvent] = []
         self._archived: List[SessionEvent] = []  # 已压缩事件归档副本（内存窗口化后仍保有全量）
         self._seq: int = 0  # 持久化游标：下一条事件的 seq
@@ -133,6 +150,28 @@ class Session:
         # 前缀事件数。非 0 时 _persist_all 先回填前缀再写窗口，避免
         # 用窗口覆盖全量历史（见 reload / _rewrite_with_prefix）。
         self._prefix_events: int = 0
+
+        if not persist:
+            self.persist_dir = None
+            self.session_dir = None
+            self.file_path = None
+            return
+
+        if session_file is not None:
+            self.file_path = Path(session_file)
+            self.session_dir = self.file_path.parent
+            self.persist_dir = self.session_dir
+            self.session_dir.mkdir(parents=True, exist_ok=True)
+            self.file_path.touch(exist_ok=True)
+            return
+
+        self.persist_dir = Path(persist_dir)
+        # 每会话独立目录（为附件/checkpoint/元数据预留空间）；
+        # 事件文件仍保持 {persist_dir}/{session_id}.jsonl 的兼容路径。
+        self.session_dir = self.persist_dir / self.session_id
+        self.file_path = self.persist_dir / f"{self.session_id}.jsonl"
+        self.persist_dir.mkdir(parents=True, exist_ok=True)
+        self.file_path.touch(exist_ok=True)  # 自动创建持久化文件
 
     # ---------- 事件追加 ----------
 
@@ -169,7 +208,7 @@ class Session:
     ) -> SessionEvent:
         """追加一条执行事件并同步持久化（一行一条 JSON）。
 
-        知识增量：追加时可通过 turn / step 标注事件所属回合与步骤，
+        追加时可通过 turn / step 标注事件所属回合与步骤，
         Compactor 按 turn 分块、按 step 排除近期。
 
         事件类型不合法时抛出 SessionEditError；返回写入的事件对象。
@@ -186,6 +225,9 @@ class Session:
         )
         self.events.append(event)
         self._seq += 1
+        if not self.persist:
+            # 纯内存模式：事件只入 events，不触达磁盘（file_path=None）
+            return event
         try:
             with self.file_path.open("a+b") as f:
                 self._trim_torn_tail(f)
@@ -307,7 +349,7 @@ class Session:
     def derive_messages(self) -> List[Message]:
         """从事件中提取完整的 LLM 历史消息列表。
 
-        知识增量：
+        处理规则：
         - 跳过 compacted=True 的旧事件（已被摘要替代）；
         - COMPACT 事件的 data(str) 摘要包装为 UserMessage 重新进入上下文。
         """
@@ -335,14 +377,19 @@ class Session:
         persist_dir: str = "sessions",
         *,
         strict: bool = False,
+        session_file: str | Path | None = None,
     ) -> "Session":
         """从持久化文件恢复会话（消息自动还原为 Message 模型）。
 
-        知识增量：恢复完成后做「seq 集合校验」`sorted(seqs) == range(N)`。
+        恢复完成后做「seq 集合校验」`sorted(seqs) == range(N)`。
         strict=False（默认）：seq 集合不连续时仅记告警日志；
         strict=True：不连续直接抛 SessionContinuityError。
         """
-        session = cls(session_id=session_id, persist_dir=persist_dir)
+        session = cls(
+            session_id=session_id,
+            persist_dir=persist_dir,
+            session_file=session_file,
+        )
         session.events.clear()
         session._seq = 0
         torn_tail = False
@@ -437,6 +484,8 @@ class Session:
         strict=True 时窗口内 seq 不连续抛 SessionContinuityError；
         strict=False（默认）仅记告警日志。返回 self。
         """
+        if not self.persist:
+            return self._reload_memory()
         window: List[SessionEvent] = []
         line_from_end = 0  # 倒数行号：1 = 文件最后一行
         torn_tail = False
@@ -510,6 +559,45 @@ class Session:
                 )
         return self
 
+    def _reload_memory(self) -> "Session":
+        """纯内存模式的窗口化重载（不涉及任何磁盘 I/O）。
+
+        语义与 `reload()` 一致：从内存事件尾部倒序扫描，命中第一条
+        compact/summary 事件即停止（该事件计入窗口），只保留「摘要 + 之后
+        的事件」作为上下文窗口。纯内存会话通常本来就只有窗口事件，因此
+        这是幂等操作。
+        """
+        window: List[SessionEvent] = []
+        for event in reversed(self.events):
+            window.append(event)
+            if event.type == EventType.COMPACT.value:
+                break
+        window.reverse()
+
+        # 已压缩（compacted=True）的历史事件转入归档副本；内存窗口只保留
+        # 可进入上下文的非压缩事件。
+        self._archived = sorted(
+            {e.seq: e for e in self._archived + self.events if e.compacted}.values(),
+            key=lambda e: e.seq,
+        )
+        self.events = [e for e in window if not e.compacted]
+        self._prefix_events = 0
+        self._seq = (
+            max((e.seq for e in self._archived + self.events), default=-1) + 1
+        )
+        return self
+
+    def destroy(self) -> None:
+        """释放纯内存会话引用（幂等）。
+
+        只清空内存事件/归档/游标，不删除磁盘文件：持久化会话仍可从 JSONL
+        恢复，纯内存会话则不再持有任何事件。
+        """
+        self.events.clear()
+        self._archived.clear()
+        self._seq = 0
+        self._prefix_events = 0
+
     @classmethod
     def resume(
         cls,
@@ -517,6 +605,7 @@ class Session:
         persist_dir: str = "sessions",
         *,
         strict: bool = False,
+        session_file: str | Path | None = None,
     ) -> "Session":
         """窗口化恢复会话（from_file 的窗口版对偶）。
 
@@ -524,9 +613,11 @@ class Session:
         「最近一次压缩之后」的上下文窗口（摘要 + 之后的事件），用于续聊；
         需要全量历史回放/审计时用 from_file。会话文件不存在时会被创建。
         """
-        return cls(session_id=session_id, persist_dir=persist_dir).reload(
-            strict=strict
-        )
+        return cls(
+            session_id=session_id,
+            persist_dir=persist_dir,
+            session_file=session_file,
+        ).reload(strict=strict)
 
     def max_turn_step(self) -> Tuple[int, int]:
         """返回全量事件（_archived 归档 + 内存窗口）中最大的 turn / step。
@@ -547,7 +638,7 @@ class Session:
             max(event.step for event in events),
         )
 
-    # ---------- 压缩 / 改写（知识增量） ----------
+    # ---------- 压缩 / 改写 ----------
 
     def mark_compacted(self, seq_start: int, seq_end: int) -> int:
         """把 [seq_start, seq_end) 区间事件标记为 compacted 并全量重写。
@@ -649,6 +740,8 @@ class Session:
         reload 的窗口化重载，会先按行回填未载入内存的磁盘前缀，避免用
         内存窗口覆盖全量历史。
         """
+        if not self.persist:
+            return
         all_events = sorted(self._archived + self.events, key=lambda e: e.seq)
         text = "".join(event.model_dump_json() + "\n" for event in all_events)
         try:
@@ -679,6 +772,8 @@ class Session:
         窗口覆盖全量历史。为保证失败时原文件完好，先写同目录临时
         文件，回填行数与 _prefix_events 不符时拒绝替换并删除临时文件。
         """
+        if not self.persist:
+            return
         tmp_path = self.file_path.with_name(self.file_path.name + ".tmp")
         copied = 0
         try:

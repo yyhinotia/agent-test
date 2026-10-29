@@ -1,6 +1,6 @@
-"""知识增量：串行审批 + 并行执行、双状态机、pre_decision 旁路。
+"""串行审批 + 并行执行、双状态机、pre_decision 旁路。
 
-覆盖 docs/增量知识.md 的 MUST_REPLICATE 与验收标准：
+覆盖验收标准：
 - ApprovalResult / ExecutionResult 双状态机（not_started vs failed）；
 - ToolCenter.execute 的 pre_decision 旁路与安全兜底（互斥）；
 - Agent._pre_step 串行审批（allowlist 级联）→ _step asyncio.gather 并行执行；
@@ -470,7 +470,7 @@ def test_approved_outside_path_is_remembered(tmp_path):
 def test_outside_workdir_approval_cascades_to_next_call(tmp_path):
     """越界 workdir：第 1 条审批放行，第 2 条命中记住的允许根走 auto。
 
-    对应真实会话里「模型把路径塞进命令文本绕开 workdir 审批」的修复：
+    覆盖场景：「模型把路径塞进命令文本绕开 workdir 审批」：
     越界工作目录现在也可审批，批准后记入允许根，无需再绕过。
     """
     sandbox = tmp_path / "sandbox"
@@ -600,7 +600,7 @@ def test_compaction_keeps_approval_semantics(tmp_path):
 
 
 def test_system_prompt_is_platform_aware():
-    """真实会话复盘：Windows 上先跑 uname 白费一次调用，改为按平台生成。"""
+    """平台感知：Windows 上先跑 uname 白费一次调用，改为按平台生成。"""
     windows = build_system_prompt("windows")
     assert windows.index("ver && cd") < windows.index("uname -s && pwd")
     assert "Windows" in windows
@@ -613,7 +613,7 @@ def test_system_prompt_is_platform_aware():
 
 
 def test_system_prompt_forbids_duplicate_confirmation():
-    """真实会话复盘：模型 confirm 一次 + 策略闸门再一次 = 用户回答两遍。"""
+    """重复确认：模型 confirm 一次 + 策略闸门再一次 = 用户回答两遍。"""
     assert "两次征询" in system_prompt
     assert "confirm" in system_prompt
     assert "不要先创建文件/目录再删除" in system_prompt

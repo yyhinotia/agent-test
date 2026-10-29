@@ -1,7 +1,7 @@
 """ReAct Agent 核心：回合循环、步骤执行与统一错误处理。
 
-知识增量（2026-09-09 知识包）
-------------------------------
+核心机制
+--------
 - 消息流：LLM 返回/工具结果不再直接 session.append，而是先入
   inbox.step，由下一步 pre_step claim 写入 session；回合收尾时
   刷空残留 step 消息，保证最终答复不丢失；
@@ -16,9 +16,14 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import json
+import re
 from pathlib import Path
+from typing import Any, Iterator
 
 from agent_test.core.inbox import InBox
+from agent_test.core.prompts import task_node_wrap_up_prompt
 from agent_test.exceptions.session import SessionEditError
 from agent_test.llm.compactor import Compactor
 from agent_test.llm.registry import LLM_CLIENT
@@ -38,6 +43,7 @@ from agent_test.types.messages import (
     ToolResultMessage,
     UserMessage,
 )
+from agent_test.utils import get_uuid
 
 
 def _event_type_for(message: Message):
@@ -63,6 +69,9 @@ class ReactAgent:
         tools=None,
         inbox: InBox | None = None,
         session: Session | None = None,
+        session_file: str | Path | None = None,
+        persist: bool = True,
+        max_turns: int | None = None,
         max_context_tokens: int = 128000,
         threshold_ratio: float = 0.8,
         remain_turns: int = 2,
@@ -77,9 +86,16 @@ class ReactAgent:
         - llm_client: LLM_CLIENT["openai"]（懒构建，需要 API_KEY 等环境变量）
         - tools:      全局 tool_center 单例（含内置 read/find/grep/edit/list/write 与 bash 命令执行工具）
         - inbox / session: 新建本 Agent 私有实例
+        - session_file: 可选完整会话文件路径（如
+          `.agent-test/sessions/<id>/session.jsonl` 或
+          `.agent-test/sessions/<graph_id>/<node_session>.jsonl`）；
+          缺省时沿用 `{persist_dir}/{session_id}.jsonl`
+        - persist:    Session 持久化模式（False = 纯内存，供 subagent 与
+                      DAG 节点一次性 Agent 使用；默认 True 保持历史行为）
+        - max_turns:  run_task 的最大回合数（None 时由调用方/默认 10 决定）
         - token_meter: 按 max_context_tokens / threshold_ratio 新建；
         - compactor: 按 remain_turns / tool_head / tool_tail 新建
-          （知识增量；测试可用 max_context_tokens=10000 验证小窗口压缩）
+          （测试可用 max_context_tokens=10000 验证小窗口压缩）
         """
         self.tool_center = tools if tools is not None else tool_center
         self.llm_client = (
@@ -89,8 +105,19 @@ class ReactAgent:
         self.session = (
             session
             if session is not None
-            else Session(session_id=session_id, persist_dir=persist_dir)
+            else Session(
+                session_id=session_id,
+                persist_dir=persist_dir,
+                persist=persist,
+                session_file=session_file,
+            )
         )
+        self.persist = persist
+        self.max_turns = max_turns
+        self.destroyed = False
+        # 最近一次 turn 的结束原因（finish / max_token / error），供 run_task
+        # 判断「模型是否给出了最终答复」。
+        self.last_turn_end_reason: str | None = None
         self.phase = Phase()
         # 恢复已有编号（注入已有 session / from_file 全量 / reload 窗口）：
         # turn 与 step 续接 session 中已用过的最大编号，续聊不会与历史事件
@@ -126,6 +153,7 @@ class ReactAgent:
         persist_dir: str = "sessions",
         *,
         strict: bool = False,
+        session_file: str | Path | None = None,
         **kwargs,
     ) -> "ReactAgent":
         """窗口化恢复已有会话并构造 Agent（续聊入口）。
@@ -143,8 +171,102 @@ class ReactAgent:
         tool_tail / token_meter / compactor）。会话文件不存在时会被创建，
         等价于在该 session_id 下开一段新会话。
         """
-        session = Session.resume(session_id, persist_dir, strict=strict)
+        session = Session.resume(
+            session_id,
+            persist_dir,
+            strict=strict,
+            session_file=session_file,
+        )
         return cls(session=session, **kwargs)
+
+    @classmethod
+    def from_agent(
+        cls,
+        source: "ReactAgent",
+        *,
+        session_id: str | None = None,
+        exclude_tools: tuple[str, ...] | list[str] = ("subagent", "span", "edit"),
+        max_turns: int | None = None,
+        persist: bool = False,
+        auto_approve: bool | None = None,
+    ) -> "ReactAgent":
+        """从现有 Agent 派生一个（默认纯内存的）子 Agent。
+
+        设计要点：
+        - 工具中心使用 `ToolCenter.clone` 复制 schema，并用 **排除法**
+          过滤掉 `subagent` / `span` 等闭包引用父 Agent 的工具（彻底断开
+          `Agent -> ToolCenter -> 闭包 -> Agent` 引用链）；
+        - 策略对象深拷贝，审批服务共享；`auto_approve=True` 时注入
+          `AutoApproveService`（只放行 REQUIRE_APPROVAL，DENY 仍由策略拦截）；
+        - LLM 客户端做浅拷贝，避免子 Agent 构造时把 `llm_client.session`
+          改成子会话、破坏父 Agent 的错误事实记录；
+        - 子 Agent 默认 `persist=False`，执行完由调用方 `destroy()`。
+
+        其余运行参数（上下文窗口、压缩保留步数、tool head/tail）继承父
+        Agent 的设置。
+        """
+        source_tools = getattr(source, "tool_center", None)
+        if getattr(source, "destroyed", False):
+            raise RuntimeError("源 Agent 已销毁，无法派生子 Agent")
+        if source_tools is not None:
+            child_tools = source_tools.clone(exclude=set(exclude_tools))
+        else:
+            child_tools = None
+        if auto_approve:
+            if child_tools is None:
+                raise ValueError("auto_approve=True 需要源 Agent 具有 tool_center")
+            from agent_test.human.service import AutoApproveService
+
+            child_tools.approver = AutoApproveService()
+
+        child_llm = _clone_llm_client(getattr(source, "llm_client", None))
+        token_meter = getattr(source, "token_meter", None)
+        compactor = getattr(source, "compactor", None)
+        return cls(
+            session_id=session_id,
+            persist=persist,
+            tools=child_tools,
+            llm_client=child_llm,
+            inbox=InBox(),
+            max_turns=max_turns if max_turns is not None else getattr(
+                source, "max_turns", None
+            ),
+            max_context_tokens=getattr(
+                token_meter, "max_context_tokens", 128000
+            ),
+            threshold_ratio=getattr(token_meter, "threshold_ratio", 0.8),
+            remain_turns=getattr(compactor, "remain_turns", 2),
+            tool_head=getattr(compactor, "tool_head", 1024),
+            tool_tail=getattr(compactor, "tool_tail", 1024),
+        )
+
+    def destroy(self) -> None:
+        """显式销毁 Agent：释放 Session/inbox/tool_center/llm 引用。
+
+        行为约定：`destroy` 后可被 GC 回收；subagent 的弱引用会
+        失效并返回安全的错误消息。持久化会话的磁盘文件保留，仍可
+        `resume`；纯内存会话的事件被清空。
+        """
+        session = getattr(self, "session", None)
+        if session is not None:
+            try:
+                session.destroy()
+            except Exception:  # noqa: BLE001
+                RuntimeLog.exception("Session.destroy 失败（继续释放其余引用）")
+        llm = getattr(self, "llm_client", None)
+        if llm is not None and getattr(llm, "session", None) is session:
+            try:
+                llm.session = None
+            except Exception:  # noqa: BLE001
+                pass
+        self.inbox = None
+        self.tool_center = None
+        self.llm_client = None
+        self.compactor = None
+        self.token_meter = None
+        self.session = None
+        self.phase.stage = AgentPhase.IDLE
+        self.destroyed = True
 
     async def turn(self) -> bool:
         """执行一轮对话。
@@ -159,6 +281,8 @@ class ReactAgent:
         时也会尽力补写 turn/end(reason=error)，不出现「开了没关」的回合。
         phase.stage 在回合内为 RUNNING，回合结束（含异常）复位 IDLE。
         """
+        if self.destroyed or self.inbox is None:
+            raise RuntimeError("Agent 已销毁，无法执行新的回合")
         if not self.inbox.has_pending():
             return False
 
@@ -211,8 +335,357 @@ class ReactAgent:
             self.phase.stage = AgentPhase.IDLE
             RuntimeLog.unbind(tokens)
 
+    # ------------------------------------------------------------------
+    # 任务执行接口（DAG 调度节点 / 结构化结果）
+    # ------------------------------------------------------------------
+
+    async def run_task(
+        self,
+        goal: str,
+        acceptance_criteria: str = "",
+        context_input: dict | None = None,
+        tool_scope: list[str] | None = None,
+        final_wrap_up_prompt: str | None = None,
+    ) -> dict[str, Any]:
+        """把 Agent 作为 DAG 节点执行单元运行，返回结构化 StepResult 兼容 dict。
+
+        与普通 `turn()` 的差异：
+        - 自动注入任务目标 / 验收标准 / 上游依赖产出 / JSON 输出约束；
+        - 最多执行 `max_turns` 个回合（默认 10），最后一个回合追加
+          收尾提示词，要求模型自检并输出 StepResult JSON；
+        - 结果解析优先使用模型 JSON；缺失时按保守规则降级为
+          `partial + acceptance_failed` 或 `failed + round_exhausted`。
+
+        tool_scope 非空时，为本 Agent 克隆一个只包含这些工具的工具中心
+        （不改动共享 ToolCenter，避免并发节点互相影响）。
+        """
+        max_rounds = self.max_turns if self.max_turns is not None else 10
+        if max_rounds <= 0:
+            raise ValueError("max_turns 必须为正整数")
+        if self.destroyed or self.inbox is None:
+            raise RuntimeError("Agent 已销毁，无法执行任务")
+
+        original_tools = self.tool_center
+        if tool_scope and original_tools is not None:
+            self.tool_center = original_tools.clone(include=set(tool_scope))
+
+        prompt = self._build_task_prompt(
+            goal=goal,
+            acceptance_criteria=acceptance_criteria,
+            context_input=context_input or {},
+            tool_scope=tool_scope or [],
+        )
+        wrap_up = final_wrap_up_prompt or task_node_wrap_up_prompt
+        rounds_used = 0
+        self.last_turn_end_reason = None
+        try:
+            for round_no in range(1, max_rounds + 1):
+                if round_no == 1:
+                    turn_prompt = prompt
+                else:
+                    turn_prompt = (
+                        "上一回合已经结束，但没有给出合法的 StepResult JSON。"
+                        "不要重复执行已完成的工作；请基于已有产出，仅输出 "
+                        "StepResult JSON。\n\n"
+                        f"# 任务目标\n{goal}\n"
+                    )
+                if round_no == max_rounds:
+                    turn_prompt = (
+                        f"{turn_prompt}\n\n{wrap_up}"
+                    )
+                self.inbox.append(
+                    "turn",
+                    UserMessage(
+                        id=get_uuid(),
+                        content=[TextBlock(content=turn_prompt)],
+                    ),
+                )
+                ran = await self.turn()
+                if not ran:
+                    break
+                rounds_used += 1
+                # 只要本回合出现过合法 StepResult 就收尾；即使模型以
+                # max_token/error 结束，也已拿到可评估结果。
+                if self._find_structured_result() is not None:
+                    break
+                if self.last_turn_end_reason == "finish":
+                    # finish 但没有合法 StepResult：继续下一轮，最后一次
+                    # 会追加 task_node_wrap_up_prompt 强制收尾。
+                    RuntimeLog.warning(
+                        "run_task finish 但未给出合法 StepResult，"
+                        "继续第 %s/%s 轮：session=%s",
+                        round_no,
+                        max_rounds,
+                        self.session.session_id if self.session else "-",
+                    )
+                    continue
+            return self._extract_task_result(
+                rounds_used=rounds_used, max_rounds=max_rounds
+            )
+        finally:
+            self.tool_center = original_tools
+
+    def _build_task_prompt(
+        self,
+        goal: str,
+        acceptance_criteria: str,
+        context_input: dict,
+        tool_scope: list[str],
+    ) -> str:
+        """组装 DAG 节点任务提示词（含上游上下文与 JSON 输出 schema）。"""
+        if context_input:
+            context_text = json.dumps(
+                context_input, ensure_ascii=False, indent=2
+            )
+            if len(context_text) > 12000:
+                context_text = context_text[:12000] + "\n…（上游上下文已截断）"
+        else:
+            context_text = "（无上游依赖产出）"
+        scope_text = (
+            "、".join(tool_scope)
+            if tool_scope
+            else "当前工具中心内全部可用工具"
+        )
+        return (
+            "# 任务目标\n"
+            f"{goal}\n\n"
+            "# 验收标准\n"
+            f"{acceptance_criteria or '完成任务并给出可验证的结果'}\n\n"
+            "# 上游依赖产出（只读上下文）\n"
+            f"{context_text}\n\n"
+            "# 工具范围\n"
+            f"{scope_text}\n"
+            "不要调用范围之外的工具。\n\n"
+            "# 输出要求（必须以 JSON 收尾）\n"
+            "完成工作后，必须在最后一条 assistant 消息中输出以下 JSON "
+            "（不要 Markdown 围栏，不要在 JSON 后追加解释）：\n"
+            '{\n'
+            '  "status": "success | partial | failed",\n'
+            '  "output": {"任意键": "任务产出的结构化结果"},\n'
+            '  "evidence": ["文件路径/命令回显/行号等可核验证据"],\n'
+            '  "self_check": true,\n'
+            '  "failure_type": null,\n'
+            '  "failure_reason": null\n'
+            '}\n'
+            "若自检未通过，请将 status 设为 partial 并填写 failure_reason。"
+        )
+
+    def _extract_task_result(
+        self, *, rounds_used: int, max_rounds: int
+    ) -> dict[str, Any]:
+        """从本回合 assistant 文本提取结构化结果，失败时保守降级。"""
+        last_text = self._last_assistant_text()
+        parsed = self._find_structured_result()
+        if parsed is not None:
+            parsed["rounds_used"] = rounds_used
+            parsed["self_check"] = bool(parsed.get("self_check", True))
+            if parsed["status"] == "success":
+                parsed["failure_type"] = None
+                parsed["failure_reason"] = None
+            elif not parsed.get("failure_type"):
+                parsed["failure_type"] = (
+                    "acceptance_failed"
+                    if parsed["status"] == "partial"
+                    else "agent_reported_failure"
+                )
+            return parsed
+
+        if self.last_turn_end_reason == "finish":
+            status = "partial"
+            failure_type = "acceptance_failed"
+            failure_reason = (
+                "模型已结束，但本回合 assistant 消息未输出符合 StepResult "
+                "schema 的 JSON"
+            )
+        elif rounds_used >= max_rounds:
+            status = "failed"
+            failure_type = "round_exhausted"
+            failure_reason = f"达到最大回合数 {max_rounds} 仍未给出结构化结果"
+        else:
+            status = "failed"
+            failure_type = "round_exhausted"
+            failure_reason = (
+                f"回合异常结束（reason={self.last_turn_end_reason}），"
+                "未获得最终结果"
+            )
+        output: dict[str, Any] = {}
+        if last_text.strip():
+            # 保留足够长的原文供事后复盘（尤其是 JSON 被正文前缀干扰时）；
+            # 12k 足以覆盖一个完整 StepResult，又不会让 checkpoint 无限膨胀。
+            raw_summary = last_text.strip()
+            output["summary"] = raw_summary[:12000]
+            if len(raw_summary) > 12000:
+                output["summary_truncated"] = True
+                output["summary_chars"] = len(raw_summary)
+        return {
+            "status": status,
+            "output": output,
+            "evidence": [],
+            "rounds_used": rounds_used,
+            "self_check": False,
+            "failure_type": failure_type,
+            "failure_reason": failure_reason,
+        }
+
+    def _current_turn_assistant_texts(self) -> list[str]:
+        """返回当前回合（最后一条 user/message 之后）的 assistant 文本列表。"""
+        if self.session is None:
+            return []
+        texts: list[str] = []
+        for event in reversed(self.session.events):
+            if event.type == EventType.USER_MESSAGE.value:
+                break
+            if event.type != EventType.ASSISTANT_MESSAGE.value:
+                continue
+            blocks = getattr(event.data, "content", None) or []
+            text = "".join(
+                block.content
+                for block in blocks
+                if isinstance(block, TextBlock)
+            )
+            if text.strip():
+                texts.append(text)
+        texts.reverse()
+        return texts
+
+    def _find_structured_result(self) -> dict[str, Any] | None:
+        """在当前回合的 assistant 消息中，从后往前找最近一个合法 StepResult。
+
+        不能只看最后一条 assistant：模型可能先输出 StepResult JSON，再追加
+        一段自然语言总结；此时最后一条文本不含 JSON，但 JSON 仍然有效。
+        """
+        for text in reversed(self._current_turn_assistant_texts()):
+            parsed = self._parse_structured_result(text)
+            if parsed is not None:
+                return parsed
+        return None
+
+    def _last_assistant_text(self) -> str:
+        """读取 session 中最后一条 assistant/message 的文本内容。"""
+        if self.session is None:
+            return ""
+        for event in reversed(self.session.events):
+            if event.type != EventType.ASSISTANT_MESSAGE.value:
+                continue
+            blocks = getattr(event.data, "content", None) or []
+            texts = [
+                block.content
+                for block in blocks
+                if isinstance(block, TextBlock)
+            ]
+            if texts:
+                return "".join(texts)
+        return ""
+
+    @staticmethod
+    def _parse_structured_result(text: str) -> dict[str, Any] | None:
+        """解析 StepResult JSON：纯 JSON / Markdown 围栏 / 嵌入 JSON 块。"""
+        if not text or not text.strip():
+            return None
+        cleaned = text.strip()
+        candidates = [cleaned]
+        # 1) Markdown 围栏：只作为额外候选，不能替换原文——正文里可能先出现
+        #    一个普通代码块（例如 README 片段），真正的 JSON 在它后面。
+        if "```" in cleaned:
+            for fence in re.finditer(
+                r"```(?:json)?\s*(.*?)```", cleaned, re.DOTALL
+            ):
+                block = fence.group(1).strip()
+                if block and block not in candidates:
+                    candidates.append(block)
+        # 2) 扫描文本中所有平衡花括号块（应对 JSON 前后的解释文本）。
+        #    不能只取第一个：正文里的 `^{commit}` / `{path}` 会先形成伪块，
+        #    真正的 StepResult JSON 往往在其后。
+        for embedded in ReactAgent._iter_json_objects(cleaned):
+            if embedded != cleaned and embedded not in candidates:
+                candidates.append(embedded)
+            if len(candidates) >= 64:  # 防御超长文本产生过多候选
+                break
+
+        for candidate in candidates:
+            try:
+                data = json.loads(candidate)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(data, dict) or "status" not in data:
+                continue
+            status = str(data.get("status", "")).strip().lower()
+            status = {
+                "completed": "success",
+                "done": "success",
+                "ok": "success",
+                "partially_done": "partial",
+                "error": "failed",
+            }.get(status, status)
+            if status not in ("success", "partial", "failed"):
+                continue
+            output = data.get("output")
+            if not isinstance(output, dict):
+                output = {"result": output} if output is not None else {}
+            evidence = data.get("evidence")
+            if not isinstance(evidence, list):
+                evidence = [str(evidence)] if evidence else []
+            return {
+                "status": status,
+                "output": output,
+                "evidence": [str(item) for item in evidence],
+                "self_check": bool(data.get("self_check", status == "success")),
+                "failure_type": data.get("failure_type"),
+                "failure_reason": data.get("failure_reason"),
+            }
+        return None
+
+    @staticmethod
+    def _iter_json_objects(text: str) -> Iterator[str]:
+        """迭代文本中所有花括号平衡的对象（字符串内花括号忽略）。
+
+        从每个 `{` 起点尝试平衡扫描，命中后从起点 +1 继续，因此嵌套对象
+        也会被枚举；调用方用 `json.loads` 自行筛选有效 JSON。
+        """
+        cursor = 0
+        while cursor < len(text):
+            start = text.find("{", cursor)
+            if start < 0:
+                return
+            obj = ReactAgent._scan_json_object(text, start)
+            if obj is not None:
+                yield obj
+            cursor = start + 1
+
+    @staticmethod
+    def _scan_json_object(text: str, start: int) -> str | None:
+        """从 start 处的 `{` 扫描一个平衡对象；未闭合返回 None。"""
+        depth = 0
+        in_string = False
+        escaped = False
+        for idx in range(start, len(text)):
+            char = text[idx]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start : idx + 1]
+        return None
+
+    @staticmethod
+    def _extract_json_object(text: str) -> str | None:
+        """兼容入口：返回文本中第一个花括号平衡的对象。"""
+        return next(ReactAgent._iter_json_objects(text), None)
+
     def _append_turn_end(self, turn_no: int, reason: str) -> None:
         """写入回合收尾事件 turn/end（reason: finish / max_token / error）。"""
+        self.last_turn_end_reason = reason
         self.session.append(
             EventType.TURN_END,
             data={"turn": turn_no, "reason": reason},
@@ -236,7 +709,7 @@ class ReactAgent:
     async def _step(self) -> str:
         """执行一步：claim step 消息 -> 组装上下文 -> 调用 LLM -> 执行工具。
 
-        工具阶段分成两步（知识增量 5.1）：
+        工具阶段分成两步：
         - _pre_step：串行预检 + 串行审批（allowlist 级联依赖顺序）；
         - _exec_one：asyncio.gather 并行执行（审批已结案，无副作用依赖）。
 
@@ -564,12 +1037,29 @@ async def _approve(
     )
 
 
+def _clone_llm_client(client):
+    """浅拷贝 LLM 客户端，避免子 Agent 覆盖父 Agent 的 `session` 引用。
+
+    适配器通常只持有 client / model / session 等简单属性，浅拷贝即可；
+    无法拷贝时退化为共享实例（功能不受影响，仅错误事实可能记录到子会话）。
+    """
+    if client is None:
+        return None
+    try:
+        return copy.copy(client)
+    except Exception:  # noqa: BLE001
+        return client
+
+
 def create_agent(
     session_id: str | None = None,
     persist_dir: str = "sessions",
     *,
     resume: bool = False,
     strict: bool = False,
+    persist: bool = True,
+    max_turns: int | None = None,
+    session_file: str | Path | None = None,
     **kwargs,
 ) -> ReactAgent:
     """Agent 统一构造入口（生命周期工厂）。
@@ -579,6 +1069,8 @@ def create_agent(
         create_agent(session_id="s-1")：指定 id 的新会话——若该文件已存在
         且非空，说明这是续聊场景，直接抛 SessionEditError 提示改用 resume，
         否则新 Agent 会从 seq 0 / turn 1 重新编号并与磁盘历史冲突。
+        create_agent(persist=False)：纯内存 Agent（subagent / DAG 节点），
+        跳过磁盘冲突检测，不创建会话文件。
 
     续聊（resume=True）：
         create_agent(session_id="s-1", resume=True)：窗口化恢复（等价
@@ -586,8 +1078,8 @@ def create_agent(
         续接已有 turn/step 编号与全量 seq。
 
     其余关键字参数原样透传给 ReactAgent（llm_client / tools / inbox /
-    max_context_tokens / threshold_ratio / remain_turns / tool_head /
-    tool_tail / token_meter / compactor）。
+    session_file / persist / max_turns / max_context_tokens / threshold_ratio /
+    remain_turns / tool_head / tool_tail / token_meter / compactor）。
     """
     if resume:
         if session_id is None:
@@ -595,16 +1087,32 @@ def create_agent(
         if "session" in kwargs:
             raise ValueError("resume=True 不接受 session=（请改用 session_id）")
         return ReactAgent.resume(
-            session_id, persist_dir, strict=strict, **kwargs
+            session_id,
+            persist_dir,
+            strict=strict,
+            session_file=session_file,
+            **kwargs,
         )
 
-    if session_id is not None:
-        existing = Path(persist_dir) / f"{session_id}.jsonl"
-        if existing.exists() and existing.stat().st_size > 0:
+    if persist:
+        if session_file is not None:
+            existing = Path(session_file)
+        elif session_id is not None:
+            existing = Path(persist_dir) / f"{session_id}.jsonl"
+        else:
+            existing = None
+        if existing is not None and existing.exists() and existing.stat().st_size > 0:
             raise SessionEditError(
                 f"会话已存在且非空，续聊请用 resume=True 或 ReactAgent.resume: "
                 f"{existing}",
                 location="create_agent",
                 detail={"session_id": session_id, "file_path": str(existing)},
             )
-    return ReactAgent(session_id=session_id, persist_dir=persist_dir, **kwargs)
+    return ReactAgent(
+        session_id=session_id,
+        persist_dir=persist_dir,
+        persist=persist,
+        max_turns=max_turns,
+        session_file=session_file,
+        **kwargs,
+    )

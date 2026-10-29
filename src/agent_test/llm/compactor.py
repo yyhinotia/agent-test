@@ -1,7 +1,7 @@
 """上下文压缩器：按 (turn,step) 全局排序、以 step 粒度排除近期，把历史
 上下文摘要化为 compact/summary 事件。
 
-知识包契约（docs/knowledge.txt）：
+压缩规则：
 - compact_session(events)：输出 "[turn=N step=S] Role: content" 文本行，
   ToolResult 超过 tool_head + tool_tail 时 head/tail 裁剪；
 - compact()：收集 (turn,step) 对 -> 全局排序 -> 排除最近 remain_turns 个
@@ -28,7 +28,7 @@ from agent_test.types.messages import (
 )
 from agent_test.utils import get_uuid
 
-# 摘要提示词：固定 8 章节结构（知识包 COMPACT_PROMPT 输出格式）
+# 摘要提示词：固定 8 章节输出格式
 _COMPACT_PROMPT = (
     "请把以下对话历史压缩为结构化摘要，严格按固定 8 章节输出：\n"
     "Primary Request / Key Technical Concepts / Files and Code / "
@@ -92,7 +92,7 @@ class Compactor:
     # ---------- 文本提取 ----------
 
     def _clip_tool_result(self, text: str) -> str:
-        """ToolResult 文本超窗口时 head/tail 裁剪（知识包 tool_head/tool_tail）。"""
+        """ToolResult 文本超窗口时 head/tail 裁剪（tool_head/tool_tail 参数）。"""
         limit = self.tool_head + self.tool_tail
         if len(text) <= limit:
             return text
@@ -114,7 +114,7 @@ class Compactor:
                 f"{_text_of(data)}"
             )
         if isinstance(data, ToolResultMessage):
-            # 双状态机（知识增量）：优先用 execution.status 表达执行结果，
+            # 双状态机：优先用 execution.status 表达执行结果，
             # 审批状态单独标注；not_started 与 failed 语义不同，压缩后
             # 不能让「审批被拒」退化成普通「执行失败」。
             approval = data.approval

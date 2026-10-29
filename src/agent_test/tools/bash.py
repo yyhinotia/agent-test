@@ -218,7 +218,7 @@ async def bash(
             command,
             cwd=str(cwd),
             # stdin 隔离：子进程不继承父进程 stdin，避免与
-            # StdinDispatcher 竞争同一终端行缓冲区（知识增量）。
+            # StdinDispatcher 竞争同一终端行缓冲区。
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,

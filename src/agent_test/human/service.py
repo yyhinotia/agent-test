@@ -1,17 +1,14 @@
 """用户交互服务（Human-in-the-Loop）：ask_user / confirm 的统一抽象。
 
-设计依据（现行优秀 agent 工具，详见 docs/hitl-tool-design-research.md）：
-- Claude Code AskUserQuestion / Agno UserFeedbackTools / Timbal ask_user：
-  澄清类问题带 2-4 个候选选项，用户可选项或自由输入，运行暂停、拿到回答后续跑；
-- Claude Code canUseTool / Timbal confirm / LangGraph interrupt：
-  批准类交互把“不可逆动作”挡在门后——批准返回 bool，拒绝返回理由；
-- 运行暂停在拿到用户输入前不产生任何该动作的副作用（对应本仓库 pre_step
-  决策先于副作用的原则）。
+设计要点：
+- 澄清类问题带 2-4 个候选选项，用户可选项或自由输入，运行暂停、拿到回答后续跑；
+- 批准类交互把“不可逆动作”挡在门后：批准返回 bool，拒绝返回理由；
+- 运行暂停在拿到用户输入前不产生任何该动作的副作用（pre_step 决策先于副作用）。
 
 本层是可注入的服务边界：
 - ConsoleAskService：CLI 交互；注入 StdinDispatcher 后所有读取走统一
   stdin 入口（后台线程独占 input() + 队列分发 + drain_pending），
-  避免主循环与审批抢同一行缓冲区（知识增量 5.3）；
+  避免主循环与审批抢同一行缓冲区；
 - 测试/嵌入方实现 AskService 注入即可（如脚本化回答、网页表单、MCP）。
 """
 from __future__ import annotations
@@ -66,10 +63,46 @@ class AskService(ABC):
         """
 
 
+class AutoApproveService(AskService):
+    """非交互执行使用的自动审批服务（subagent / DAG 节点）。
+
+    语义边界：
+    - 只对 `REQUIRE_APPROVAL` 返回批准，让一次性 Agent 可以无人值守地
+      执行需要审批的命令；
+    - `DENY` 规则仍由 `CommandPolicy` 在审批之前硬拦截，本服务无法放行；
+    - `ask_user` 不阻塞等待人工输入，返回固定说明，避免调度器卡死。
+
+    交互式 CLI 不应默认使用本服务，除非用户显式要求自动批准。
+    """
+
+    def __init__(self, reason: str = "auto-approved") -> None:
+        self.reason = reason
+
+    async def ask_user(
+        self,
+        *,
+        question: str,
+        options: Sequence[str] | None = None,
+        multi_select: bool = False,
+        header: str | None = None,
+    ) -> str:
+        return (
+            "（当前为非交互子 Agent，无法向用户提问；"
+            "请基于已有上下文自行决策，并在结果中说明假设）"
+        )
+
+    async def confirm(
+        self,
+        action: str,
+        description: str | None = None,
+    ) -> tuple[bool, str]:
+        return True, self.reason
+
+
 class ConsoleAskService(AskService):
     """CLI 交互实现：通过标准输入收集用户回答。
 
-    dispatcher（知识增量）：注入 StdinDispatcher 后，主循环 / 审批 /
+    dispatcher：注入 StdinDispatcher 后，主循环 / 审批 /
     ask_user 三条读取路径共用同一个后台读取线程，不再各自调用 input()；
     缺省 None 时退化为 asyncio.to_thread(input)，仅适用于单一读取路径的
     简单 CLI。

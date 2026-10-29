@@ -1,7 +1,7 @@
 """Token 用量计量器：根据 LLM usage 判断是否接近/超过上下文窗口阈值。
 
-知识增量契约
---------------
+约定
+----
 - update: 覆盖式赋值（非累加），因为 usage.total_tokens 是本次请求的
   完整上下文大小（prompt + 历史 + 输出），不是增量；
 - is_over_threshold: total_tokens > max_context_tokens * threshold_ratio；

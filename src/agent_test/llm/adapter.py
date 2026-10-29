@@ -4,7 +4,7 @@
 异常链），完整堆栈由 ReactAgent 统一写入日志文件，调用位置在 session
 中记录 runtime/error 事件。
 
-知识增量：
+行为约定：
 - stream() 返回三元组 (AssistantMessage, end_reason, usage)；
 - 调用时携带 stream_options={"include_usage": True} 请求用量，
   服务端缺省时用 _fetch_usage_fallback 发非流式请求（max_tokens=1）
@@ -36,7 +36,27 @@ from agent_test.utils import get_uuid
 load_dotenv()
 
 
-# 审批 / 执行标签（知识增量）：把双状态机渲染成 LLM 可读的标签行，
+def _sanitize_no_proxy_env() -> None:
+    """清理 NO_PROXY 中 httpx 无法解析的方括号 IPv6 条目（如 ``[::1]``）。
+
+    背景：Windows 开发机常把 NO_PROXY 写成 ``...::1,[::1]``。httpx 会把
+    ``[::1]`` 当作带端口的 URL 解析并抛 ``Invalid port: ':1]'``，导致
+    AsyncOpenAI 构造失败、所有 LLM 调用不可用。这里只移除方括号形式的
+    条目，保留裸 ``::1`` / ``127.0.0.1`` 等有效项。
+    """
+    for key in ("NO_PROXY", "no_proxy"):
+        value = os.environ.get(key)
+        if not value or "[" not in value:
+            continue
+        parts = [
+            part
+            for part in value.split(",")
+            if not (part.strip().startswith("[") and part.strip().endswith("]"))
+        ]
+        os.environ[key] = ",".join(part for part in parts if part.strip())
+
+
+# 审批 / 执行标签：把双状态机渲染成 LLM 可读的标签行，
 # 让模型能区分「审批被拒、从未执行」与「已执行但失败」。
 _APPROVAL_LABELS = {
     "auto": "审批:自动放行",
@@ -125,7 +145,7 @@ class LLMBaseAdapter:
 
             elif isinstance(message, ToolResultMessage):
                 text = "\n".join(block.content for block in message.content)
-                # 审批/执行标签渲染（知识增量）：把双状态机前置为标签行，
+                # 审批/执行标签渲染：把双状态机前置为标签行，
                 # LLM 才能分辨「用户拒绝」与「执行失败」。
                 labels: List[str] = []
                 if message.approval is not None:
@@ -150,6 +170,7 @@ class OPENAIAdapter(LLMBaseAdapter):
 
     def __init__(self) -> None:
         super().__init__()
+        _sanitize_no_proxy_env()
         self.client = AsyncOpenAI(
             api_key=os.environ["API_KEY"],
             base_url=os.environ["BASE_URI"],
@@ -167,7 +188,7 @@ class OPENAIAdapter(LLMBaseAdapter):
             'max_token'  达到最大 token 上限
             ''           模型请求调用工具（Agent 应继续下一步）
 
-        usage（知识增量）:
+        usage:
             {"prompt_tokens": int, "completion_tokens": int,
              "total_tokens": int} 或 None；服务端未返回时用
             _fetch_usage_fallback 发非流式请求兜底，失败返回 None。
@@ -191,7 +212,7 @@ class OPENAIAdapter(LLMBaseAdapter):
             )
 
             # OpenAI 流式返回工具调用时按 index 分片，需要累积拼接；
-            # text delta 累积为单个 TextBlock（知识增量）
+            # text delta 累积为单个 TextBlock
             tool_call_fragments: Dict[int, Dict[str, str]] = {}
             content_parts: List[str] = []
             async for chunk in stream:
@@ -245,7 +266,7 @@ class OPENAIAdapter(LLMBaseAdapter):
                 ]
                 assistant_message.content = tool_calls
             elif content_parts:
-                # 知识增量：text delta 累积为单个 TextBlock
+                # text delta 累积为单个 TextBlock
                 assistant_message.content = [TextBlock(content="".join(content_parts))]
 
             if usage is None:
@@ -271,7 +292,7 @@ class OPENAIAdapter(LLMBaseAdapter):
     ) -> Dict[str, Any] | None:
         """服务端未返回 usage 时的降级：非流式请求获取准确 usage。
 
-        知识包契约：usage=None 时发 stream=False、max_tokens=1 请求，
+        约定：usage=None 时发 stream=False、max_tokens=1 请求，
         从响应 usage 提取 token 计数；请求失败返回 None，不阻断主流程
         （TokenMeter 按无用量处理，等待下一轮真实 usage）。
         """

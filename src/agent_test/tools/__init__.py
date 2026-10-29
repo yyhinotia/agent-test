@@ -16,6 +16,7 @@ from agent_test.tools.builtin import (
 from agent_test.tools.ask import register_ask
 from agent_test.tools.bash import bash, register_bash
 from agent_test.tools.center import ToolCenter
+from agent_test.tools.subagent import register_span, register_subagent
 
 __all__ = [
     "tool_center",
@@ -24,6 +25,8 @@ __all__ = [
     "register_bash",
     "register_ask",
     "register_builtins",
+    "register_span",
+    "register_subagent",
     "read",
     "find",
     "edit",

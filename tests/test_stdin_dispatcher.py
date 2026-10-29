@@ -1,4 +1,4 @@
-"""知识增量：统一 stdin 分发器（StdinDispatcher）+ 排空陈旧输入 + EOF 降级。"""
+"""统一 stdin 分发器（StdinDispatcher）+ 排空陈旧输入 + EOF 降级。"""
 import asyncio
 import io
 
@@ -193,7 +193,7 @@ def test_application_wires_policy_and_approver(tmp_path):
     assert {"bash", "ask_user", "confirm"} <= names
 
 
-# ---------------- drain_policy（真实会话复盘后新增） ----------------
+# ---------------- drain_policy ----------------
 
 def test_drain_policy_auto_disabled_when_stdin_is_not_tty(monkeypatch):
     """管道/重定向下不排空：否则会吞掉脚本自己的行（含 y/n 回答）。"""

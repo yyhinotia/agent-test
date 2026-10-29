@@ -1,0 +1,100 @@
+{
+  "fixtures": [
+    {
+      "dag": {
+        "graph_id": "replan-chain",
+        "global_goal": "验证 PAE 重规划与传递依赖失效（replan-chain）",
+        "nodes": [
+          {
+            "node_id": "baseline",
+            "goal": "创建文件 `.replan-demo/baseline.txt`，内容严格为 `BASELINE-OK`（允许末尾一个换行）。完成后在 StepResult 的 output 中返回 {\"file\": \".replan-demo/baseline.txt\", \"value\": \"BASELINE-OK\"}。",
+            "acceptance_criteria": "`.replan-demo/baseline.txt` 存在，内容去掉首尾空白后等于 `BASELINE-OK`；output.value 等于 `BASELINE-OK`。",
+            "tool_scope": ["read", "write", "list"],
+            "depends_on": [],
+            "max_rounds": 6,
+            "priority": 3,
+            "metadata": {"demo": "replan-chain", "role": "unrelated-success"}
+          },
+          {
+            "node_id": "prepare",
+            "goal": "把 `.replan-demo/value.txt` 写成严格内容 `0`（允许末尾一个换行）。写完后读取一次确认，并在 StepResult 的 output 中返回 {\"file\": \".replan-demo/value.txt\", \"value\": 0}。",
+            "acceptance_criteria": "`.replan-demo/value.txt` 存在，内容去掉首尾空白后等于 `0`；output.value 必须为整数 0。",
+            "tool_scope": ["read", "write", "list"],
+            "depends_on": [],
+            "max_rounds": 6,
+            "priority": 2,
+            "metadata": {"demo": "replan-chain", "role": "changed-upstream"}
+          },
+          {
+            "node_id": "probe",
+            "goal": "读取 `.replan-demo/value.txt`，把去掉首尾空白后的内容原样放入 StepResult 的 output.value（字符串）。如果文件不存在或读取失败，返回 status=failed。不要修改任何文件。",
+            "acceptance_criteria": "成功读取文件；output.value 与文件内容（去掉首尾空白）逐字一致。",
+            "tool_scope": ["read"],
+            "depends_on": ["prepare"],
+            "max_rounds": 5,
+            "priority": 1,
+            "metadata": {"demo": "replan-chain", "role": "stale-downstream"}
+          },
+          {
+            "node_id": "gate",
+            "goal": "只依据上游依赖产出判断：取 `probe.output.value`，按字符串去掉首尾空白后与 `1` 比较。等于 `1` 时返回 status=success；不等于 `1`（包括缺失、`0` 或其他值）时必须返回 status=failed、failure_type=`acceptance_failed`、failure_reason=`expected=1 actual=<实际值>`。本节点没有任何工具，不要读取或修改文件，也不要因为无法执行环境检查而失败，直接给出判断。",
+            "acceptance_criteria": "success 仅当 probe.output.value 字符串化并去掉首尾空白后严格等于 `1`；否则必须 failed。output 必须包含 {\"expected\": 1, \"actual\": <实际值>, \"pass\": <bool>}。",
+            "tool_scope": ["__none__"],
+            "depends_on": ["probe"],
+            "max_rounds": 3,
+            "priority": 0,
+            "metadata": {"demo": "replan-chain", "role": "first-attempt-failure"}
+          }
+        ]
+      }
+    },
+    {
+      "dag": {
+        "graph_id": "replan-chain",
+        "global_goal": "验证 PAE 重规划与传递依赖失效（replan-chain）",
+        "nodes": [
+          {
+            "node_id": "baseline",
+            "goal": "创建文件 `.replan-demo/baseline.txt`，内容严格为 `BASELINE-OK`（允许末尾一个换行）。完成后在 StepResult 的 output 中返回 {\"file\": \".replan-demo/baseline.txt\", \"value\": \"BASELINE-OK\"}。",
+            "acceptance_criteria": "`.replan-demo/baseline.txt` 存在，内容去掉首尾空白后等于 `BASELINE-OK`；output.value 等于 `BASELINE-OK`。",
+            "tool_scope": ["read", "write", "list"],
+            "depends_on": [],
+            "max_rounds": 6,
+            "priority": 3,
+            "metadata": {"demo": "replan-chain", "role": "unrelated-success"}
+          },
+          {
+            "node_id": "prepare",
+            "goal": "把 `.replan-demo/value.txt` 写成严格内容 `1`（允许末尾一个换行）。写完后读取一次确认，并在 StepResult 的 output 中返回 {\"file\": \".replan-demo/value.txt\", \"value\": 1}。",
+            "acceptance_criteria": "`.replan-demo/value.txt` 存在，内容去掉首尾空白后等于 `1`；output.value 必须为整数 1。",
+            "tool_scope": ["read", "write", "list"],
+            "depends_on": [],
+            "max_rounds": 6,
+            "priority": 2,
+            "metadata": {"demo": "replan-chain", "role": "changed-upstream"}
+          },
+          {
+            "node_id": "probe",
+            "goal": "读取 `.replan-demo/value.txt`，把去掉首尾空白后的内容原样放入 StepResult 的 output.value（字符串）。如果文件不存在或读取失败，返回 status=failed。不要修改任何文件。",
+            "acceptance_criteria": "成功读取文件；output.value 与文件内容（去掉首尾空白）逐字一致。",
+            "tool_scope": ["read"],
+            "depends_on": ["prepare"],
+            "max_rounds": 5,
+            "priority": 1,
+            "metadata": {"demo": "replan-chain", "role": "stale-downstream"}
+          },
+          {
+            "node_id": "gate",
+            "goal": "只依据上游依赖产出判断：取 `probe.output.value`，按字符串去掉首尾空白后与 `1` 比较。等于 `1` 时返回 status=success；不等于 `1`（包括缺失、`0` 或其他值）时必须返回 status=failed、failure_type=`acceptance_failed`、failure_reason=`expected=1 actual=<实际值>`。本节点没有任何工具，不要读取或修改文件，也不要因为无法执行环境检查而失败，直接给出判断。",
+            "acceptance_criteria": "success 仅当 probe.output.value 字符串化并去掉首尾空白后严格等于 `1`；否则必须 failed。output 必须包含 {\"expected\": 1, \"actual\": <实际值>, \"pass\": <bool>}。",
+            "tool_scope": ["__none__"],
+            "depends_on": ["probe"],
+            "max_rounds": 3,
+            "priority": 0,
+            "metadata": {"demo": "replan-chain", "role": "first-attempt-failure"}
+          }
+        ]
+      }
+    }
+  ]
+}

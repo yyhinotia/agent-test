@@ -1,6 +1,6 @@
 """CLI 审批服务：统一 stdin + 排空陈旧输入 + 审计日志。
 
-与 ConsoleAskService 的差异（知识增量 5.3 / 6）：
+与 ConsoleAskService 的差异：
 
 - 必须走 StdinDispatcher：主循环与审批共享同一终端，只有后台线程独占
   input() 才能消除"审批被陈旧输入自动批准"的竞争；

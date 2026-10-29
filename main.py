@@ -9,18 +9,17 @@
     API_KEY / BASE_URI / MODEL_NAME
 
 说明：
-- 默认每次运行新建一个 Agent（create_agent），其私有 Session 自动在 sessions/
-  目录生成 {session_id}.jsonl 持久化文件，记录本轮全部执行事件；
-- --resume <session_id>：create_agent(resume=True)——只加载最近一次压缩之后的
-  上下文窗口（session-reload），并自动续接已有 turn/step 编号与全量 seq；
-- 所有 agent-runtime 日志（含错误堆栈）额外写入 logs/runtime.log；
-  错误发生时，session 中还会多一条 runtime/error 事件（location +
-  error_type + message 摘要），与日志按 session_id 关联。
+- 默认运行工作区为 cwd/.agent-test；普通会话路径为
+  .agent-test/sessions/{session_id}/session.jsonl；
+- --resume <session_id>：从上述路径窗口化恢复并续接编号；
+- 所有 agent-runtime 日志写入 .agent-test/logs/runtime.log；
+- 演示入口自动注册 subagent 工具。
 """
 import argparse
 import asyncio
 import os
 import sys
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -28,6 +27,7 @@ load_dotenv()
 
 from agent_test import create_agent
 from agent_test.log.runtime_log import RuntimeLog
+from agent_test.tools.subagent import register_subagent
 from agent_test.types.messages import TextBlock, UserMessage
 from agent_test.utils import get_uuid
 
@@ -44,12 +44,26 @@ def ensure_env() -> None:
 
 async def run(prompt: str, resume: str | None = None) -> None:
     ensure_env()
-    RuntimeLog.configure("logs")
+    workspace = Path(".agent-test")
+    sessions_root = workspace / "sessions"
+    RuntimeLog.configure(workspace / "logs")
+    session_id = resume or get_uuid()
+    session_file = sessions_root / session_id / "session.jsonl"
     agent = (
-        create_agent(resume=True, session_id=resume)
+        create_agent(
+            resume=True,
+            session_id=session_id,
+            session_file=str(session_file),
+        )
         if resume
-        else create_agent()
+        else create_agent(
+            session_id=session_id,
+            session_file=str(session_file),
+        )
     )
+    # 演示入口同样启用 subagent 子 Agent 委托（weakref 捕获，不阻塞 GC）
+    if agent.tool_center is not None and "subagent" not in agent.tool_center.tools:
+        register_subagent(agent.tool_center, agent)
     tokens = RuntimeLog.bind(session_id=agent.session.session_id)
     try:
         # 1. 把用户消息放入本 Agent 的 inbox turn 队列
@@ -82,6 +96,7 @@ async def run(prompt: str, resume: str | None = None) -> None:
                 print("[assistant]", "".join(texts))
     finally:
         RuntimeLog.unbind(tokens)
+        agent.destroy()
 
 
 def _quiet_asyncgen_close(_loop, context) -> None:

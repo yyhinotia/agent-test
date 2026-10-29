@@ -1,6 +1,6 @@
 """审计脚本的提示词规则判定（scripts/audit_session.py）。
 
-回归 00c6dbaa 会话的误报：`python -c "import a; b"` 里的分号在引号内，
+回归：`python -c "import a; b"` 里的分号在引号内，
 是语言字面量而非命令分隔符，不该判 FAIL。
 """
 import importlib.util

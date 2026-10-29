@@ -1,5 +1,6 @@
 """核心组件的本地冒烟测试（不依赖网络 / API Key）。"""
 import asyncio
+import os
 
 import pytest
 
@@ -23,6 +24,18 @@ from agent_test.utils import get_now, get_uuid
 def test_uuid_and_now():
     assert get_uuid()
     assert get_now()
+
+
+def test_sanitize_no_proxy_strips_bracket_ipv6(monkeypatch):
+    """NO_PROXY 中 [::1] 会让 httpx 抛 Invalid port: ':1]'，适配器需清洗。"""
+    from agent_test.llm.adapter import _sanitize_no_proxy_env
+
+    monkeypatch.setenv("NO_PROXY", "localhost,::1,[::1],127.0.0.1")
+    _sanitize_no_proxy_env()
+
+    assert "[::1]" not in os.environ["NO_PROXY"]
+    assert "::1" in os.environ["NO_PROXY"]
+    assert "127.0.0.1" in os.environ["NO_PROXY"]
 
 
 def test_tool_call_block_args_dict():

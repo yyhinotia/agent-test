@@ -20,7 +20,11 @@ class EventType(str, Enum):
     TURN_END = "turn/end"
     RUNTIME_ERROR = "runtime/error"
     COMPACT = "compact/summary"  # Compactor 生成的摘要事件
-
+    TASK_START = 'task/start'
+    TASK_END = 'task/end'
+    PLAN_START = "plan/start"
+    PLAN_UPDATE = "plan/update"
+    PLAN_END = "plan/end"
 
 class AgentPhase(str, Enum):
     """Agent 顶层生命周期阶段。"""
@@ -32,7 +36,7 @@ class AgentPhase(str, Enum):
 class Phase:
     """对话阶段计数器：回合（turn）与步骤（step）编号 + 顶层生命周期阶段。
 
-    stage 用 AgentPhase 枚举而不是字符串字面量（知识增量）：
+    stage 用 AgentPhase 枚举而不是字符串字面量：
     - IDLE：未在执行回合（初始状态、回合结束后）；
     - RUNNING：turn() 正在执行（turn/start 已写出，尚未收尾）。
     回合与步骤的细分位置由 turn/step 计数器与 session 事件表达，不再用
@@ -48,7 +52,7 @@ class Phase:
 class SessionEvent(BaseModel):
     """Session 中记录的一条事件（持久化到 JSONL 的行结构）。
 
-    知识增量新增三个字段（Compactor / TokenMeter 依赖）：
+    新增三个字段（Compactor / TokenMeter 依赖）：
     - turn:      事件所属回合编号。turn() 开始时 self.phase.turn += 1，
                  同一 turn 内可能有多个 step；
     - step:      turn 内每次调用 LLM 的编号。_step() 开始时

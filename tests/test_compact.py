@@ -1,6 +1,6 @@
 """Compactor / TokenMeter 集成测试：上下文窗口 10000 下的正常、准确压缩。
 
-按知识包（docs/knowledge.txt）验收：
+验收点：
 - 单 turn 多 step 场景按 step 粒度排除最近 remain_turns 个 step（非按 turn）；
 - compact_session 输出 "[turn=N step=S] Role: content"，ToolResult 超窗口裁剪；
 - 两级压缩：一级保留近期 step，无可压缩块时降级二级全量；
@@ -44,7 +44,7 @@ def _tool(text: str, *, is_error: bool = False) -> ToolResultMessage:
 def test_compactor_single_turn_multi_step_keeps_recent_steps(tmp_path):
     """单 turn 多 step：排除最近 remain_turns 个 step，压缩更早的 step。
 
-    知识包验收标准：单 turn 多 step 场景压缩正确排除最近 N 个 step
+    验收标准：单 turn 多 step 场景压缩正确排除最近 N 个 step
     （非按 turn 排除——若按 turn 会把整个 turn 保留、一个都压不掉）。
     """
     session = Session(persist_dir=str(tmp_path))
@@ -302,7 +302,7 @@ def test_agent_context_window_10000_compacts_normally(tmp_path):
     assert any(e.compacted for e in restored.events), "磁盘应保留被压缩事件"
     assert restored.derive_messages() == agent.session.derive_messages()
 
-# ---------- 单元：usage 降级（非流式兜底请求，知识包 3.4） ----------
+# ---------- 单元：usage 降级（非流式兜底请求） ----------
 
 
 class _NS:
@@ -371,7 +371,7 @@ def test_fetch_usage_fallback_failure_returns_none():
 def test_compactor_memory_window_keeps_disk_full(tmp_path):
     """压缩后内存只保留上下文窗口，磁盘保持全量历史。
 
-    窗口化优化 + 知识包契约：
+    窗口化行为：
     - 内存 events 不再残留 compacted 事件（只含 compact 摘要 + 最近事件）；
     - 磁盘 JSONL 始终是全量 0..N-1 序列（被压缩事件完整持久化）；
     - 窗口化后 append 的 seq 仍全局连续；from_file 恢复全量且 derive 一致；

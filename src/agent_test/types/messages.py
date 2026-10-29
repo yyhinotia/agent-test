@@ -65,7 +65,7 @@ ExecutionStatus = Literal["not_started", "success", "failed"]
 class ApprovalResult(BaseModel):
     """审批状态机：回答「是否允许执行」。
 
-    与 ExecutionResult 拆成两个独立状态机（知识增量）：旧的 is_error 同时
+    与 ExecutionResult 拆成两个独立状态机：旧的 is_error 同时
     表达「审批被拒」与「执行失败」，LLM 无法区分二者。
 
     decision 取值：
@@ -98,7 +98,7 @@ class ExecutionResult(BaseModel):
 class ToolResultMessage(BaseModel):
     """工具调用结果消息。
 
-    approval / execution（知识增量）：审批与执行是两个独立状态机；
+    approval / execution：审批与执行是两个独立状态机；
     is_error 保留用于向后兼容（等价于 execution.status != "success"）。
     旧 JSONL 无这两个字段，缺省 None（按需回退到 is_error 语义）。
     """
