@@ -79,7 +79,7 @@ uv run python -m agent_test.app \
 
 ```bash
 uv run pytest -q
-# 258 passed（普通 shell）
+# 273 passed（普通 shell）
 ```
 
 ---
@@ -104,6 +104,7 @@ agent-test/
 │   ├── policy/                   # 命令治理（工作目录/规则/审批）
 │   ├── human/                    # AskService 与 StdinDispatcher
 │   ├── types/                    # 消息 / 事件 / 计划 / 工具 Schema
+│   ├── metrics/                  # Evaluator：token / turn / 节点执行次数
 │   ├── exceptions/               # 统一异常体系
 │   ├── log/                      # RuntimeLog
 │   └── utils.py
@@ -123,6 +124,7 @@ agent-test/
 | `core/inbox.py` | turn/step 两区消息队列，每个 Agent 私有 |
 | `core/prompts.py` | 系统提示词、DAG planner prompt、节点收尾 prompt |
 | `core/plan_service.py` | `Plan` 创建、DAG 字典规范化 |
+| `metrics/evaluator.py` | `Evaluator` / `AgentMetrics` / `TaskMetrics` |
 | `session/session.py` | JSONL 事件、窗口化 `reload`、压缩打标/摘要、`from_file` |
 | `llm/adapter.py` | OpenAI 流式适配，返回 `(message, end_reason, usage)` |
 | `llm/token_meter.py` | 按最近一次 usage 判断上下文阈值 |
@@ -288,7 +290,10 @@ agent2 = create_agent(
 - `Compactor(session, summarize=None, llm_client=None)`：按 `(turn, step)` 排序，
   以 step 粒度保留最近 `remain_turns` 个 step，把更早历史摘要为
   `compact/summary` 事件；无可压缩块时降级为全量压缩；
-- 压缩后内存 `events` 只保留上下文窗口，磁盘 JSONL 保持全量历史（seq 连续）。
+- 压缩后内存 `events` 只保留上下文窗口，磁盘 JSONL 保持全量历史（seq 连续）；
+- usage 缺失时：小 prompt（估算 ≤ 8000 tokens）发一次非流式请求取准确值；
+  大 prompt 直接本地字符估算并标记 `estimated`，避免为拿 usage 重发全量
+  prompt 造成约 2x 输入 token 成本。
 
 ---
 
@@ -325,7 +330,11 @@ plan_and_execute(goal)                      # PAE 主循环
   └─ REPLAN    未达成且次数未耗尽 -> attempt+1，回到 PLAN
 ```
 
+- 同一 assistant 消息可以同时包含文本与 `tool_call`：文本保留在 session，
+  工具继续执行，不再二选一；
 - 最后一层在落盘前先评估全局状态，最终 Checkpoint 记录 success / failed；
+- 每个节点无条件克隆独立 `ToolCenter` 与 `CommandPolicy`（有无 `tool_scope`
+  或 `--auto-approve` 都一样），避免并发审批记忆互相污染；
 - `rounds_used` 表示 `run_task` 的外层回合数（模型未给出合法 StepResult 时的重试次数），
   不是工具 step 数；step 数可从 session 事件观察。
 
@@ -350,6 +359,9 @@ plan_and_execute(goal)                      # PAE 主循环
 
 - 每个图独立文件：`.agent-test/checkpoints/{graph_id}.jsonl`；
 - 每层一条深拷贝快照，包含 `TaskDAG` + `GraphState` + 节点输出/证据/输入快照；
+- 失败 / 部分完成节点会导出压缩记忆（最近对话摘要 + 失败事实），成功节点
+  默认不导出；重规划时作为 `restored_memory` 注入任务提示词，避免失败节点
+  从零重来。记忆是摘要，不是完整对话回放；
 - `rollback_to_checkpoint(steps=1 | target_checkpoint_id=...)`：回退并截断 JSONL；
 - `resume_from_jsonl()`：从最新 Layer 的下一层继续；若仍有未达成节点，自动进入 PAE；
 - `--resume-checkpoint`：CLI 断点恢复，可用 `--graph-id` 指定图，或自动选最新文件。
@@ -469,7 +481,7 @@ pwsh -File tasks/replan-chain/run.ps1
 
 ```bash
 uv run pytest -q
-# 258 passed
+# 273 passed
 ```
 
 重点测试：
@@ -478,10 +490,13 @@ uv run pytest -q
 | --- | --- |
 | `tests/test_scheduler.py` | 拓扑分层、子图、PAE、Checkpoint、传递依赖失效、max_turns、CLI |
 | `tests/test_run_task.py` | StepResult 解析、finish 重试、最后回合收尾 |
+| `tests/test_llm_stream_mixed.py` | 同一消息同时返回文本与 tool_call 时不丢文本 |
+| `tests/test_metrics.py` | Agent token/turn 累计、Task 节点执行均值、planner 用量 |
 | `tests/test_workspace_layout.py` | `.agent-test` 路径、graph checkpoint、CLI 工作区参数 |
 | `tests/test_subagent_tool.py` | subagent / weakref / span 别名 |
 | `tests/test_session_pure_memory.py` | 纯内存 Session / `persist=False` |
 | `tests/test_compact.py` | TokenMeter + Compactor 端到端压缩 |
+| `tests/test_task_types.py` | Task / TaskStatus 类型别名可导入 |
 | `tests/test_bash_tool.py` | bash 回显 / 退出码 / 超时 / 编码 |
 | `tests/test_approval_parallel.py` | 串行审批 + 并行执行、双状态机 |
 
@@ -509,8 +524,12 @@ uv run pytest -q
 
 - **全局成功不是机器验收**：`global_status=success` 等价于所有节点自检通过，
   不保证 `acceptance_criteria` 被独立验证；重要任务应加最终校验节点。
-- **REPLAN 不恢复失败节点记忆**：`agent_memory_dump` 当前不注入新 Agent，
-  失败节点在重规划时从零开始；成功节点按签名/依赖/快照复用。
+- **REPLAN 记忆是摘要**：失败/部分节点会注入最近对话摘要与失败原因，
+  不是完整对话回放；成功节点默认不导出记忆。
+- **每节点独立 ToolCenter**：即使没有 `tool_scope`、未开启 `--auto-approve`，
+  每个节点也会克隆独立的 `CommandPolicy`，避免并发审批状态串台。
+- **usage 兜底有阈值**：大 prompt 缺 usage 时使用本地估算，不保证与
+  服务端计数逐 token 一致，适合阈值触发而非精确计费。
 - **调度是层屏障**：同层 `gather` 等待最慢节点，未实现依赖就绪队列；
   层内快节点会被慢节点拖住。
 - **`--max-turns` 是外层回合下限**：不限制工具 step 数；长节点可能触发上下文压缩。
@@ -519,7 +538,57 @@ uv run pytest -q
 
 ---
 
-## 12. 相关文档
+## 12. 指标测评
+
+`agent_test.metrics.Evaluator` 从运行中的 `ReactAgent` / `Scheduler` 收集指标：
+
+```python
+from agent_test import Evaluator
+
+agent_metrics = Evaluator.from_agent(agent)
+task_metrics = Evaluator.from_task(scheduler)
+payload = Evaluator.snapshot(agent=agent, scheduler=scheduler)
+```
+
+`AgentMetrics`：
+
+- `turns`：本次进程实际执行的 turn 数；
+- `steps` / `llm_calls` / `tool_calls`：`steps` 是主循环 step 数，
+  `llm_calls` 还包括 Compactor 摘要与 subagent 子 Agent 的调用；
+- `prompt_tokens` / `completion_tokens` / `total_tokens`；
+- `estimated_calls`：usage 由本地估算的次数；
+- `elapsed_seconds`：本 Agent 实际 turn 执行耗时之和（不含空闲等待）。
+
+`TaskMetrics`：
+
+- `total_tokens`：planner + 所有节点执行的总 token；
+- `total_turns`：planner + 所有节点执行的总 turn；
+- `node_executions`：节点实际执行次数（复用/跳过不计）；
+- `average_node_executions`：`node_executions / 最终 DAG 节点数`；
+- `average_node_turns`：`node_turns / 最终 DAG 节点数`；
+- `reused_node_count` / `replanned_node_count`：
+  重规划 attempt（attempt > 0）中复用的成功节点数 / 重规划 DAG 节点数；
+- `node_reuse_rate`：`reused_node_count / replanned_node_count`；
+- `critical_path_turns`：按每个 attempt 的 `layers` 逐层取
+  `max(turns_n)`，再加该 attempt 的 planner turns，最终对所有 attempt 求和；
+  与 `total_turns`（总工作量）对比可看并发的延迟收益；
+- `elapsed_seconds`：Task 从 `plan_and_execute` 开始到结束的 wall time；
+- `node_elapsed_seconds`：所有节点执行耗时之和（并发时可能大于 wall time）；
+- `nodes`：每个节点的执行次数、turns、tokens、耗时明细。
+
+`--task` 模式结束时会打印一行：
+
+```text
+[metrics] total_tokens=58112 prompt_tokens=55682 completion_tokens=2430 total_turns=7 planner_turns=0 node_turns=7 node_executions=7 avg_node_executions=1.75 reused_node_count=1 node_reuse_rate=0.25 critical_path_turns=6 elapsed_seconds=19.24
+```
+
+指标是**当前进程内**的累计值；断点恢复后的历史执行不自动回填。
+`total_tokens` 包含 Compactor 摘要调用与 `subagent` 子 Agent 的 token；
+`turns` 只统计主 Agent / 节点 Agent 自身的 turn，不把子 Agent 内部 turn 计入。
+
+---
+
+## 13. 相关文档
 
 - `tasks/replan-chain/README.md`：重规划示例任务的运行方式与判定证据；
 - `scripts/audit_session.py`：会话审计与机械判定工具。

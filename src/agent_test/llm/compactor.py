@@ -88,6 +88,28 @@ class Compactor:
         self.remain_turns = remain_turns
         self._summarize = summarize
         self.llm_client = llm_client
+        # 压缩本身也可能调用 LLM，单独累计，供 Agent 指标合并
+        self.usage_totals = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+        self.llm_calls = 0
+        self.estimated_usage_calls = 0
+
+    def _record_usage(self, usage: dict | None) -> None:
+        if not usage:
+            return
+        prompt = int(usage.get("prompt_tokens", 0) or 0)
+        completion = int(usage.get("completion_tokens", 0) or 0)
+        total = int(usage.get("total_tokens", 0) or 0)
+        if total <= 0:
+            total = prompt + completion
+        self.usage_totals["prompt_tokens"] += prompt
+        self.usage_totals["completion_tokens"] += completion
+        self.usage_totals["total_tokens"] += total
+        if usage.get("estimated"):
+            self.estimated_usage_calls += 1
 
     # ---------- 文本提取 ----------
 
@@ -189,7 +211,9 @@ class Compactor:
                 id=get_uuid(), content=[TextBlock(content=_COMPACT_PROMPT + text)]
             )
             try:
-                assistant, _, _ = await self.llm_client.stream([prompt], None)
+                assistant, _, usage = await self.llm_client.stream([prompt], None)
+                self.llm_calls += 1
+                self._record_usage(usage)
                 return _text_of(assistant)
             except Exception:  # noqa: BLE001
                 pass

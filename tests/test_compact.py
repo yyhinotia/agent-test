@@ -365,6 +365,52 @@ def test_fetch_usage_fallback_failure_returns_none():
     adapter2 = _fallback_adapter(no_usage)
     assert asyncio.run(adapter2._fetch_usage_fallback([], None)) is None
 
+def test_usage_estimate_skips_large_prompt_fallback():
+    """大 prompt 缺 usage 时本地估算，不再重发全量请求。"""
+    calls: list[dict] = []
+
+    async def boom(**kwargs):
+        calls.append(kwargs)
+        raise AssertionError("large prompt must not trigger fallback request")
+
+    adapter = _fallback_adapter(boom)
+    adapter.usage_fallback_max_prompt_tokens = 10
+    usage = asyncio.run(
+        adapter._resolve_usage(
+            [{"role": "user", "content": "x" * 2000}], None
+        )
+    )
+
+    assert calls == []
+    assert usage is not None
+    assert usage["estimated"] is True
+    assert usage["prompt_tokens"] > 10
+
+
+def test_usage_resolution_uses_request_for_small_prompt():
+    """小 prompt 仍走非流式请求，保证 usage 准确。"""
+    calls: list[dict] = []
+
+    async def fake_create(**kwargs):
+        calls.append(kwargs)
+        return _NS(
+            usage=_NS(prompt_tokens=10, completion_tokens=5, total_tokens=15)
+        )
+
+    adapter = _fallback_adapter(fake_create)
+    adapter.usage_fallback_max_prompt_tokens = 8000
+    usage = asyncio.run(
+        adapter._resolve_usage([{"role": "user", "content": "hi"}], None)
+    )
+
+    assert len(calls) == 1
+    assert usage == {
+        "prompt_tokens": 10,
+        "completion_tokens": 5,
+        "total_tokens": 15,
+    }
+
+
 # ---------- 单元：内存窗口化（events 只作上下文窗口，磁盘保全量） ----------
 
 

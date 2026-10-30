@@ -216,6 +216,89 @@ def test_run_task_final_round_appends_wrap_up_prompt():
     assert "status" in llm.prompts[1]
 
 
+def test_task_prompt_skips_env_check_without_bash():
+    """tool_scope 不含 bash 时必须明确禁用系统提示词的环境检查。"""
+    llm = _SequenceLLM(["unused"])
+    agent = create_agent(
+        persist=False,
+        llm_client=llm,
+        tools=ToolCenter(),
+        max_turns=1,
+    )
+    try:
+        prompt = agent._build_task_prompt(
+            goal="只读检查",
+            acceptance_criteria="",
+            context_input={},
+            tool_scope=["read", "grep"],
+        )
+        with_bash = agent._build_task_prompt(
+            goal="可执行检查",
+            acceptance_criteria="",
+            context_input={},
+            tool_scope=["read", "bash"],
+        )
+    finally:
+        agent.destroy()
+
+    assert "未启用 bash 工具" in prompt
+    assert "跳过系统提示词第 1 节" in prompt
+    assert "未启用 bash 工具" not in with_bash
+
+
+def test_run_task_injects_restored_memory():
+    """失败节点重试时，上次摘要与失败原因必须进入任务提示词。"""
+    llm = _SequenceLLM(
+        [
+            '{"status":"success","output":{"ok":true},'
+            '"evidence":["retry"],"self_check":true}'
+        ]
+    )
+    agent = create_agent(
+        persist=False,
+        llm_client=llm,
+        tools=ToolCenter(),
+        max_turns=1,
+    )
+    try:
+        result = asyncio.run(
+            agent.run_task(
+                goal="重试节点",
+                restored_memory={
+                    "summary": "上次已读取 a.txt，缺少 b.txt",
+                    "failure_reason": "b.txt 不存在",
+                },
+            )
+        )
+    finally:
+        agent.destroy()
+
+    assert result["status"] == "success"
+    assert "上次尝试记忆" in llm.prompts[0]
+    assert "上次已读取 a.txt" in llm.prompts[0]
+    assert "b.txt 不存在" in llm.prompts[0]
+
+
+def test_task_prompt_omits_memory_section_without_memory():
+    llm = _SequenceLLM(["unused"])
+    agent = create_agent(
+        persist=False,
+        llm_client=llm,
+        tools=ToolCenter(),
+        max_turns=1,
+    )
+    try:
+        prompt = agent._build_task_prompt(
+            goal="普通任务",
+            acceptance_criteria="",
+            context_input={},
+            tool_scope=[],
+        )
+    finally:
+        agent.destroy()
+    assert "上次尝试记忆" not in prompt
+
+
 def test_find_structured_result_scans_current_turn_backwards():
     """JSON 在较早 assistant 消息、最后一条是 prose 时，仍应找到 StepResult。"""
     llm = _SequenceLLM(["unused"])

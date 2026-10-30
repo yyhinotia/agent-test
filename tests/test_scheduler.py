@@ -20,7 +20,7 @@ from agent_test.app.scheduler import (
 from agent_test.app.application import parse_args
 from agent_test.core.plan_service import PlanService
 from agent_test.tools.center import ToolCenter
-from agent_test.types.messages import AssistantMessage, TextBlock
+from agent_test.types.messages import AssistantMessage, TextBlock, UserMessage
 from agent_test.types.plans import Plan, PlanStatus, PlanStep
 
 
@@ -1034,6 +1034,101 @@ def test_resume_recovers_downstream_when_input_matches(tmp_path):
     assert scheduler._recover_prior_successes() == 1
     assert scheduler.dag_state.node_states["b"].status is NodeStatus.SUCCESS
     assert scheduler.dag_state.node_states["b"].output == {"seen": 1}
+
+
+def test_isolated_tool_center_always_clones_policy(tmp_path):
+    """即使无 tool_scope / 无 auto_approve，节点也必须拿到独立 policy。"""
+    from agent_test.app.scheduler import _isolated_tool_center
+    from agent_test.policy import CommandPolicy
+
+    base = ToolCenter(policy=CommandPolicy(allowed_roots=[tmp_path]))
+    one = _isolated_tool_center(base, [], False)
+    two = _isolated_tool_center(base, [], False)
+
+    assert one is not base and two is not base and one is not two
+    assert one.policy is not base.policy
+    assert one.policy is not two.policy
+    assert _isolated_tool_center(base, [], True).approver is not None
+
+
+def test_task_node_exports_memory_on_failure(monkeypatch):
+    """失败节点必须导出摘要与失败事实，并把 restored_memory 传下去。"""
+    from agent_test.app import scheduler as scheduler_module
+
+    class _Session:
+        session_id = "sess-1"
+
+        def derive_messages(self):
+            return [
+                UserMessage(id="u", content=[TextBlock(content="读取 a.txt")]),
+                AssistantMessage(
+                    id="a", content=[TextBlock(content="文件不存在")]
+                ),
+            ]
+
+    class _Agent:
+        def __init__(self):
+            self.session = _Session()
+            self.kwargs = {}
+
+        async def run_task(self, **kwargs):
+            self.kwargs = kwargs
+            return {
+                "status": "failed",
+                "failure_type": "acceptance_failed",
+                "failure_reason": "missing b.txt",
+                "output": {"missing": "b.txt"},
+                "evidence": [],
+                "self_check": False,
+            }
+
+        def destroy(self):
+            return None
+
+    fake = _Agent()
+    monkeypatch.setattr(
+        scheduler_module, "create_agent", lambda **kwargs: fake
+    )
+    node = TaskNode(node_id="n1", goal="读取文件", tool_scope=["read"])
+    result = asyncio.run(
+        node.run(
+            context_input={},
+            restored_memory={"summary": "上一轮摘要"},
+            tool_center=ToolCenter(),
+            persist_sessions=False,
+        )
+    )
+
+    assert fake.kwargs["restored_memory"] == {"summary": "上一轮摘要"}
+    assert result.status == "failed"
+    assert result.agent_memory_dump["status"] == "failed"
+    assert result.agent_memory_dump["failure_reason"] == "missing b.txt"
+    assert "读取 a.txt" in result.agent_memory_dump["summary"]
+
+
+def test_reconcile_preserves_memory_on_fatal_failure(tmp_path):
+    """fatal 失败也会进入重规划，重试前不应丢掉已导出的记忆摘要。"""
+    old_dag = _make_dag([{"node_id": "a", "goal": "A"}])
+    new_dag = _make_dag([{"node_id": "a", "goal": "A"}])
+    scheduler = Scheduler(checkpoint_file=str(tmp_path / "ck.jsonl"))
+    scheduler.task_dag = old_dag
+    scheduler.dag_state = GraphState(
+        graph_id="g",
+        node_states={
+            "a": NodeState(
+                node_id="a",
+                status=NodeStatus.FAILED_FATAL,
+                failure_type="acceptance_failed",
+                agent_memory_dump={"summary": "上次失败摘要"},
+            )
+        },
+    )
+
+    scheduler._reconcile_state(new_dag)
+
+    state = scheduler.dag_state.node_states["a"]
+    assert state.status is NodeStatus.PENDING
+    assert state.agent_memory_dump == {"summary": "上次失败摘要"}
 
 
 def test_final_layer_checkpoint_has_evaluated_global_status(tmp_path):

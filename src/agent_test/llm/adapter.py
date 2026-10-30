@@ -6,13 +6,14 @@
 
 行为约定：
 - stream() 返回三元组 (AssistantMessage, end_reason, usage)；
-- 调用时携带 stream_options={"include_usage": True} 请求用量，
-  服务端缺省时用 _fetch_usage_fallback 发非流式请求（max_tokens=1）
-  获取准确 usage，失败返回 None 不阻断主流程；
+- 调用时携带 stream_options={"include_usage": True} 请求用量；
+  服务端缺省 usage 时，小 prompt 用非流式请求取准确值，大 prompt 用
+  本地估算，避免为拿 usage 重发一次全量 prompt；
 - text delta 累积为单个 TextBlock（不再每个 delta 独立一条）。
 """
 from __future__ import annotations
 
+import json
 import os
 from typing import Any, Dict, List, Tuple
 
@@ -23,6 +24,7 @@ from agent_test.exceptions.llm import LlmError
 from agent_test.types.messages import (
     ApprovalResult,
     AssistantMessage,
+    ContentBlock,
     ExecutionResult,
     Message,
     TextBlock,
@@ -34,6 +36,9 @@ from agent_test.core.prompts import system_prompt as system_prompt_default
 from agent_test.utils import get_uuid
 
 load_dotenv()
+
+# 超过该估算阈值时不再为拿 usage 重发全量 prompt，改用本地估算。
+_USAGE_FALLBACK_MAX_PROMPT_TOKENS = 8000
 
 
 def _sanitize_no_proxy_env() -> None:
@@ -176,6 +181,9 @@ class OPENAIAdapter(LLMBaseAdapter):
             base_url=os.environ["BASE_URI"],
         )
         self.model_name = os.environ["MODEL_NAME"]
+        self.usage_fallback_max_prompt_tokens = (
+            _USAGE_FALLBACK_MAX_PROMPT_TOKENS
+        )
         self.STATUS = {"stop": "finish", "length": "max_token", "tool_calls": ""}
 
     async def stream(
@@ -255,22 +263,24 @@ class OPENAIAdapter(LLMBaseAdapter):
                     if tc.function and tc.function.arguments:
                         frag["arguments"] += tc.function.arguments
 
+            content_blocks: List[ContentBlock] = []
+            if content_parts:
+                content_blocks.append(
+                    TextBlock(content="".join(content_parts))
+                )
             if tool_call_fragments:
-                tool_calls = [
+                content_blocks.extend(
                     ToolCallBlock(
                         id=frag["id"],
                         name=frag["name"],
                         args=frag["arguments"],
                     )
                     for frag in tool_call_fragments.values()
-                ]
-                assistant_message.content = tool_calls
-            elif content_parts:
-                # text delta 累积为单个 TextBlock
-                assistant_message.content = [TextBlock(content="".join(content_parts))]
+                )
+            assistant_message.content = content_blocks
 
             if usage is None:
-                usage = await self._fetch_usage_fallback(openai_message, tools)
+                usage = await self._resolve_usage(openai_message, tools)
 
         except Exception as exc:  # noqa: BLE001
             raise LlmError(
@@ -287,14 +297,45 @@ class OPENAIAdapter(LLMBaseAdapter):
                     pass
         return assistant_message, end_reason, usage
 
+    @staticmethod
+    def _estimate_prompt_tokens(
+        openai_message: List[Dict[str, Any]], tools: List[Dict] | None
+    ) -> int:
+        """粗略估算 prompt token 数（字符数 / 4，保守下限 1）。"""
+        try:
+            payload = json.dumps(
+                openai_message, ensure_ascii=False
+            ) + json.dumps(tools or [], ensure_ascii=False)
+        except Exception:  # noqa: BLE001
+            payload = str(openai_message)
+        return max(1, len(payload) // 4)
+
+    async def _resolve_usage(
+        self, openai_message: List[Dict[str, Any]], tools: List[Dict] | None
+    ) -> Dict[str, Any] | None:
+        """usage 缺失时的降级：大 prompt 本地估算，小 prompt 请求准确值。"""
+        estimated = self._estimate_prompt_tokens(openai_message, tools)
+        limit = getattr(
+            self,
+            "usage_fallback_max_prompt_tokens",
+            _USAGE_FALLBACK_MAX_PROMPT_TOKENS,
+        )
+        if estimated > limit:
+            return {
+                "prompt_tokens": estimated,
+                "completion_tokens": 0,
+                "total_tokens": estimated,
+                "estimated": True,
+            }
+        return await self._fetch_usage_fallback(openai_message, tools)
+
     async def _fetch_usage_fallback(
         self, openai_message: List[Dict[str, Any]], tools: List[Dict] | None
     ) -> Dict[str, Any] | None:
-        """服务端未返回 usage 时的降级：非流式请求获取准确 usage。
+        """小 prompt 缺 usage 时的精确兜底：发一次非流式请求。
 
-        约定：usage=None 时发 stream=False、max_tokens=1 请求，
-        从响应 usage 提取 token 计数；请求失败返回 None，不阻断主流程
-        （TokenMeter 按无用量处理，等待下一轮真实 usage）。
+        大 prompt 由 `_resolve_usage` 直接本地估算，避免为拿 usage 重发
+        全量 prompt；本方法仅用于低于阈值的小请求。
         """
         try:
             resp = await self.client.chat.completions.create(

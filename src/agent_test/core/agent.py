@@ -19,6 +19,7 @@ import asyncio
 import copy
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -119,6 +120,18 @@ class ReactAgent:
         # 判断「模型是否给出了最终答复」。
         self.last_turn_end_reason: str | None = None
         self.phase = Phase()
+        # 本次进程内的累计指标（供 Evaluator 读取）
+        self.usage_totals = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+        self.llm_calls = 0
+        self.estimated_usage_calls = 0
+        self.turns_executed = 0
+        self.steps_executed = 0
+        self.tool_calls_executed = 0
+        self.elapsed_seconds = 0.0
         # 恢复已有编号（注入已有 session / from_file 全量 / reload 窗口）：
         # turn 与 step 续接 session 中已用过的最大编号，续聊不会与历史事件
         # 重号（step 是全局递增计数器）。空 session 为 (0, 0)，行为不变。
@@ -286,7 +299,9 @@ class ReactAgent:
         if not self.inbox.has_pending():
             return False
 
+        started = time.perf_counter()
         self.phase.turn += 1
+        self.turns_executed += 1
         self.phase.stage = AgentPhase.RUNNING
         turn_no = self.phase.turn
         tokens = RuntimeLog.bind(
@@ -332,6 +347,7 @@ class ReactAgent:
             self._close_turn_best_effort(turn_no)
             raise
         finally:
+            self.elapsed_seconds += time.perf_counter() - started
             self.phase.stage = AgentPhase.IDLE
             RuntimeLog.unbind(tokens)
 
@@ -345,6 +361,7 @@ class ReactAgent:
         acceptance_criteria: str = "",
         context_input: dict | None = None,
         tool_scope: list[str] | None = None,
+        restored_memory: dict | None = None,
         final_wrap_up_prompt: str | None = None,
     ) -> dict[str, Any]:
         """把 Agent 作为 DAG 节点执行单元运行，返回结构化 StepResult 兼容 dict。
@@ -358,6 +375,7 @@ class ReactAgent:
 
         tool_scope 非空时，为本 Agent 克隆一个只包含这些工具的工具中心
         （不改动共享 ToolCenter，避免并发节点互相影响）。
+        restored_memory 为上次失败/部分完成的记忆摘要，会注入任务提示词。
         """
         max_rounds = self.max_turns if self.max_turns is not None else 10
         if max_rounds <= 0:
@@ -374,6 +392,7 @@ class ReactAgent:
             acceptance_criteria=acceptance_criteria,
             context_input=context_input or {},
             tool_scope=tool_scope or [],
+            restored_memory=restored_memory,
         )
         wrap_up = final_wrap_up_prompt or task_node_wrap_up_prompt
         rounds_used = 0
@@ -431,6 +450,7 @@ class ReactAgent:
         acceptance_criteria: str,
         context_input: dict,
         tool_scope: list[str],
+        restored_memory: dict | None = None,
     ) -> str:
         """组装 DAG 节点任务提示词（含上游上下文与 JSON 输出 schema）。"""
         if context_input:
@@ -446,16 +466,38 @@ class ReactAgent:
             if tool_scope
             else "当前工具中心内全部可用工具"
         )
+        scope_note = ""
+        if tool_scope and "bash" not in tool_scope:
+            scope_note = (
+                "\n注意：本节点未启用 bash 工具，请跳过系统提示词第 1 节的"
+                "首轮环境检查，直接使用允许的工具执行任务。\n"
+            )
+        memory_text = ""
+        if restored_memory:
+            summary = str(restored_memory.get("summary") or "").strip()
+            failure = str(
+                restored_memory.get("failure_reason") or ""
+            ).strip()
+            if summary or failure:
+                memory_text = (
+                    "\n# 上次尝试记忆（只读参考）\n"
+                    "本节点上一次执行未完成；以下内容用于恢复状态，"
+                    "不要重复已完成的工作。\n"
+                    + (f"{summary}\n" if summary else "")
+                    + (f"上次失败原因：{failure}\n" if failure else "")
+                )
         return (
             "# 任务目标\n"
             f"{goal}\n\n"
             "# 验收标准\n"
             f"{acceptance_criteria or '完成任务并给出可验证的结果'}\n\n"
             "# 上游依赖产出（只读上下文）\n"
-            f"{context_text}\n\n"
+            f"{context_text}\n"
+            f"{memory_text}\n"
             "# 工具范围\n"
             f"{scope_text}\n"
-            "不要调用范围之外的工具。\n\n"
+            "不要调用范围之外的工具。\n"
+            f"{scope_note}\n"
             "# 输出要求（必须以 JSON 收尾）\n"
             "完成工作后，必须在最后一条 assistant 消息中输出以下 JSON "
             "（不要 Markdown 围栏，不要在 JSON 后追加解释）：\n"
@@ -706,6 +748,21 @@ class ReactAgent:
                 self.session.file_path,
             )
 
+    def _record_usage(self, usage: dict | None) -> None:
+        """把单次 LLM usage 累加到 Agent 级指标。"""
+        if not usage:
+            return
+        prompt = int(usage.get("prompt_tokens", 0) or 0)
+        completion = int(usage.get("completion_tokens", 0) or 0)
+        total = int(usage.get("total_tokens", 0) or 0)
+        if total <= 0:
+            total = prompt + completion
+        self.usage_totals["prompt_tokens"] += prompt
+        self.usage_totals["completion_tokens"] += completion
+        self.usage_totals["total_tokens"] += total
+        if usage.get("estimated"):
+            self.estimated_usage_calls += 1
+
     async def _step(self) -> str:
         """执行一步：claim step 消息 -> 组装上下文 -> 调用 LLM -> 执行工具。
 
@@ -716,6 +773,7 @@ class ReactAgent:
         返回 end_reason：''（需要继续工具循环）/ finish / max_token / error。
         """
         self.phase.step += 1
+        self.steps_executed += 1
         step_idx = self.phase.step
         self.session.append(
             EventType.STEP_START,
@@ -732,6 +790,8 @@ class ReactAgent:
             assistant_message, end_reason, usage = await self.llm_client.stream(
                 all_messages, self.tool_center.get_schemas()
             )
+            self.llm_calls += 1
+            self._record_usage(usage)
 
             # ③ TokenMeter 阈值检测：超阈值 -> Compactor 两级压缩 -> 复位
             self.token_meter.update(usage)
@@ -764,6 +824,7 @@ class ReactAgent:
             )
             for tool_result in tool_results:
                 self.inbox.append("step", tool_result)
+            self.tool_calls_executed += len(tool_calls)
 
             self.session.append(
                 EventType.STEP_END,
@@ -811,7 +872,25 @@ class ReactAgent:
     async def _compact_context(self) -> str | None:
         """上下文压缩：两级压缩——一级保留最近 remain_turns 个 step，
         无可压缩事件时降级二级全量；返回摘要文本或 None。"""
-        return await self.compactor.compact()
+        compactor = self.compactor
+        before_usage = dict(getattr(compactor, "usage_totals", {}) or {})
+        before_calls = int(getattr(compactor, "llm_calls", 0) or 0)
+        before_estimated = int(
+            getattr(compactor, "estimated_usage_calls", 0) or 0
+        )
+        summary = await compactor.compact()
+        after_usage = dict(getattr(compactor, "usage_totals", {}) or {})
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            self.usage_totals[key] += int(after_usage.get(key, 0) or 0) - int(
+                before_usage.get(key, 0) or 0
+            )
+        self.llm_calls += int(getattr(compactor, "llm_calls", 0) or 0) - (
+            before_calls
+        )
+        self.estimated_usage_calls += int(
+            getattr(compactor, "estimated_usage_calls", 0) or 0
+        ) - before_estimated
+        return summary
 
     async def _pre_step(
         self, tool_calls: list[ToolCallBlock]

@@ -323,6 +323,7 @@ async def run_task_mode(args: argparse.Namespace) -> int:
         Scheduler,
         _safe_session_id,
     )
+    from agent_test.metrics import Evaluator
 
     workspace = Path(args.workspace_dir)
     sessions_root = (
@@ -406,6 +407,22 @@ async def run_task_mode(args: argparse.Namespace) -> int:
                 f"[node] {node.node_id} status={node_state.status.value} "
                 f"rounds={node_state.rounds_used} output={output}"
             )
+    metrics = Evaluator.from_task(scheduler)
+    print(
+        "[metrics] "
+        f"total_tokens={metrics.total_tokens} "
+        f"prompt_tokens={metrics.prompt_tokens} "
+        f"completion_tokens={metrics.completion_tokens} "
+        f"total_turns={metrics.total_turns} "
+        f"planner_turns={metrics.planner_turns} "
+        f"node_turns={metrics.node_turns} "
+        f"node_executions={metrics.node_executions} "
+        f"avg_node_executions={metrics.average_node_executions:.2f} "
+        f"reused_node_count={metrics.reused_node_count} "
+        f"node_reuse_rate={metrics.node_reuse_rate:.2f} "
+        f"critical_path_turns={metrics.critical_path_turns} "
+        f"elapsed_seconds={metrics.elapsed_seconds:.2f}"
+    )
     return 0 if state.global_status == NodeStatus.SUCCESS else 1
 
 

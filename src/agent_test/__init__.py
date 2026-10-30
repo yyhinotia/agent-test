@@ -63,17 +63,20 @@ from agent_test.app.scheduler import (
 )
 from agent_test.app.application import Application, main
 from agent_test.app.cli_ask_service import CLIAskService
+from agent_test.metrics import AgentMetrics, Evaluator, NodeMetrics, TaskMetrics
 
 __version__ = "0.6.0"
 
 __all__ = [
     "AgentBaseError",
+    "AgentMetrics",
     "Application",
     "ApprovalResult",
     "AskService",
     "AutoApproveService",
     "CLIAskService",
     "ConsoleAskService",
+    "Evaluator",
     "ExecutionResult",
     "StdinDispatcher",
     "main",
@@ -115,8 +118,10 @@ __all__ = [
     "Scheduler",
     "TaskDAG",
     "TaskNode",
+    "TaskMetrics",
     "StepResult",
     "NodeState",
+    "NodeMetrics",
     "NodeStatus",
     "GraphState",
     "CheckpointRecord",

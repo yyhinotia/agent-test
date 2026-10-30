@@ -10,6 +10,7 @@ from agent_test.types.messages import (
     UserMessage,
 )
 from agent_test.types.tools import ToolCenterSchema, ToolSchema
+from agent_test.types.task import Task, TaskStatus
 
 __all__ = [
     "AgentPhase",
@@ -19,6 +20,8 @@ __all__ = [
     "Message",
     "Phase",
     "SessionEvent",
+    "Task",
+    "TaskStatus",
     "TextBlock",
     "ToolCallBlock",
     "ToolCenterSchema",

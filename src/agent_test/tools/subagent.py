@@ -23,6 +23,7 @@ from typing import Any, Set
 
 from agent_test.human.service import AutoApproveService
 from agent_test.log.runtime_log import RuntimeLog
+from agent_test.metrics.evaluator import agent_metric_values
 from agent_test.tools.center import ToolCenter
 from agent_test.types.events import EventType
 from agent_test.types.messages import TextBlock, UserMessage
@@ -41,6 +42,25 @@ _SUBAGENT_PARAMETERS: dict[str, Any] = {
         "description": "可选的共享上下文（父任务背景、上游结论、约束等）",
     },
 }
+
+
+def _merge_child_usage(parent: Any, child: Any) -> None:
+    """把子 Agent 的 token / LLM 调用次数合并到父 Agent 指标。"""
+    values = agent_metric_values(child)
+    usage = getattr(parent, "usage_totals", None)
+    if isinstance(usage, dict):
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            usage[key] = int(usage.get(key, 0) or 0) + int(
+                values.get(key, 0) or 0
+            )
+    if hasattr(parent, "llm_calls"):
+        parent.llm_calls = int(parent.llm_calls or 0) + int(
+            values.get("llm_calls", 0) or 0
+        )
+    if hasattr(parent, "estimated_usage_calls"):
+        parent.estimated_usage_calls = int(
+            parent.estimated_usage_calls or 0
+        ) + int(values.get("estimated_calls", 0) or 0)
 
 
 def _last_assistant_text(session) -> str:
@@ -164,6 +184,7 @@ def register_subagent(
             return f"子 Agent 执行失败: {type(exc).__name__}: {exc}"
         finally:
             if child is not None:
+                _merge_child_usage(parent, child)
                 try:
                     child.destroy()
                 except Exception:  # noqa: BLE001

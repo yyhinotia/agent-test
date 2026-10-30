@@ -18,6 +18,7 @@ import inspect
 import json
 import os
 import re
+import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from enum import Enum
@@ -30,6 +31,12 @@ from agent_test.core.agent import ReactAgent, create_agent
 from agent_test.core.plan_service import PlanService
 from agent_test.core.prompts import dag_planner_prompt
 from agent_test.human.service import AutoApproveService
+from agent_test.metrics.evaluator import (
+    add_metrics,
+    agent_metric_values,
+    result_metric_values,
+    zero_metrics,
+)
 from agent_test.log.runtime_log import RuntimeLog
 from agent_test.tools.center import ToolCenter
 from agent_test.types.events import EventType
@@ -81,6 +88,15 @@ class StepResult(BaseModel):
     output: dict = Field(default_factory=dict)
     evidence: list[str] = Field(default_factory=list)
     rounds_used: int = 0
+    turns: int = 0
+    steps: int = 0
+    llm_calls: int = 0
+    tool_calls: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    estimated_calls: int = 0
+    elapsed_seconds: float = 0.0
     self_check: bool = False
     failure_type: str | None = None
     failure_reason: str | None = None
@@ -219,9 +235,10 @@ class TaskNode(BaseModel):
 
         Args:
             context_input: 上游依赖节点产出 ``{node_id: {goal, output, ...}}``；
-            restored_memory: 预留的内存快照（当前版本不注入上下文）；
-            tool_center: 共享 ToolCenter；``tool_scope`` 非空或需要自动审批时
-                         会克隆出隔离副本，避免并发节点互相影响；
+            restored_memory: 上次失败/部分完成的记忆摘要；会注入任务提示词；
+            tool_center: 可共享的工具中心；每个节点都会克隆出独立的
+                          ToolCenter/CommandPolicy，避免并发节点互相污染；
+                          ``tool_scope`` 非空时只保留指定工具；
             graph_id: 所属 DAG，用于构造节点会话 id；
             plan_attempt: 当前 PAE 尝试序号；会话 id 为
                          ``{graph_id}_{node_id}_att{plan_attempt}``，
@@ -231,7 +248,7 @@ class TaskNode(BaseModel):
             sessions_dir: 落盘目录；
             llm_client: 可注入的 LLM 客户端（测试/嵌入方）；
             auto_approve: 是否需要给节点 Agent 注入自动审批；
-            export_memory: 是否把节点对话导出到 ``agent_memory_dump``。
+            export_memory: 成功节点是否导出记忆；失败/部分完成节点始终导出。
         """
         session_id = build_node_session_id(
             graph_id, self.node_id, plan_attempt
@@ -246,17 +263,9 @@ class TaskNode(BaseModel):
                 # 同一 attempt 重跑时清理旧的同名会话，避免 seq 冲突
                 session_file.unlink()
 
-        center = tool_center
-        if center is None and auto_approve:
-            # 未显式传入 center 时基于全局工具中心克隆，避免污染单例
-            from agent_test.tools import tool_center as global_tool_center
-
-            center = global_tool_center.clone()
-        if center is not None and (self.tool_scope or auto_approve):
-            include = set(self.tool_scope) if self.tool_scope else None
-            center = center.clone(include=include)
-            if auto_approve and center.approver is None:
-                center.approver = AutoApproveService()
+        center = _isolated_tool_center(
+            tool_center, self.tool_scope, auto_approve
+        )
 
         agent_kwargs: dict[str, Any] = {
             "persist": persist_sessions,
@@ -283,12 +292,17 @@ class TaskNode(BaseModel):
                 acceptance_criteria=self.acceptance_criteria,
                 context_input=context_input,
                 tool_scope=self.tool_scope,
+                restored_memory=restored_memory,
+            )
+            should_export = (
+                export_memory or raw_res.get("status") != "success"
             )
             memory = (
-                _export_agent_memory(agent)
-                if export_memory and agent.session is not None
+                _export_agent_memory(agent, raw_res)
+                if should_export and agent.session is not None
                 else {}
             )
+            metrics = agent_metric_values(agent)
         finally:
             agent.destroy()
 
@@ -298,6 +312,17 @@ class TaskNode(BaseModel):
             output=raw_res.get("output", {}),
             evidence=raw_res.get("evidence", []),
             rounds_used=raw_res.get("rounds_used", 1),
+            turns=metrics["turns"],
+            steps=metrics["steps"],
+            llm_calls=metrics["llm_calls"],
+            tool_calls=metrics["tool_calls"],
+            prompt_tokens=metrics["prompt_tokens"],
+            completion_tokens=metrics["completion_tokens"],
+            total_tokens=metrics["total_tokens"],
+            estimated_calls=metrics["estimated_calls"],
+            elapsed_seconds=float(
+                getattr(agent, "elapsed_seconds", 0.0) or 0.0
+            ),
             self_check=raw_res.get("self_check", True),
             failure_type=raw_res.get("failure_type"),
             failure_reason=raw_res.get("failure_reason"),
@@ -305,14 +330,84 @@ class TaskNode(BaseModel):
         )
 
 
-def _export_agent_memory(agent: ReactAgent) -> dict:
-    """导出节点 Agent 的上下文快照（消息列表，JSON 兼容）。"""
+def _isolated_tool_center(
+    tool_center: ToolCenter | None,
+    tool_scope: list[str],
+    auto_approve: bool,
+) -> ToolCenter:
+    """为单个 DAG 节点克隆独立的 ToolCenter 与 CommandPolicy。
+
+    即使节点没有 tool_scope、也没有开启 auto_approve，也不能直接共享
+    调度器级 ToolCenter：并发节点的审批记忆会写入同一份 policy，
+    造成 allowlist / allowed_roots 串台。
+    """
+    from agent_test.tools import tool_center as global_tool_center
+
+    base = tool_center if tool_center is not None else global_tool_center
+    include = set(tool_scope) if tool_scope else None
+    center = base.clone(include=include)
+    if auto_approve and center.approver is None:
+        center.approver = AutoApproveService()
+    return center
+
+
+def _memory_summary(messages: list, *, limit: int = 4000) -> str:
+    """把节点最后几条消息压成可注入提示词的短摘要。"""
+    lines: list[str] = []
+    for message in messages[-8:]:
+        try:
+            data = message.model_dump(mode="json")
+        except Exception:  # noqa: BLE001
+            continue
+        role = str(data.get("role") or "")
+        content = data.get("content")
+        parts: list[str] = []
+        if isinstance(content, str):
+            parts.append(content)
+        elif isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                text = block.get("content")
+                if isinstance(text, str):
+                    parts.append(text)
+                elif block.get("name"):
+                    parts.append(
+                        f"[{block['name']} {str(block.get('args', ''))[:200]}]"
+                    )
+        text = " ".join(part.strip() for part in parts if part.strip())
+        if not text:
+            continue
+        # 节点任务提示词会在重试时重新注入，记忆里不再重复整段目标/验收标准。
+        if role == "user" and (
+            "# 任务目标" in text or "# 验收标准" in text
+        ):
+            continue
+        lines.append(f"{role}: {text[:600]}")
+    return "\n".join(lines)[:limit]
+
+
+def _export_agent_memory(
+    agent: ReactAgent, result: dict[str, Any] | None = None
+) -> dict:
+    """导出节点记忆：最近对话摘要 + 最后一次失败事实。"""
     try:
         messages = agent.session.derive_messages()
-        return {
+        payload: dict[str, Any] = {
             "session_id": agent.session.session_id,
-            "messages": [m.model_dump(mode="json") for m in messages],
+            "message_count": len(messages),
+            "summary": _memory_summary(messages),
         }
+        if result:
+            payload.update(
+                {
+                    "status": result.get("status"),
+                    "failure_type": result.get("failure_type"),
+                    "failure_reason": result.get("failure_reason"),
+                    "output": result.get("output") or {},
+                }
+            )
+        return payload
     except Exception:  # noqa: BLE001
         return {}
 
@@ -667,6 +762,19 @@ class Scheduler:
         self.plan_exhausted = False
         self.last_subgraph_nodes: set[str] | None = None
         self._current_layer_index: int = -1
+
+        # 本次进程内的 Task 累计指标（跨 attempt 保留）
+        self._node_execution_counts: dict[str, int] = {}
+        self._node_usage: dict[str, dict[str, int]] = {}
+        self._planner_usage: dict[str, int] = zero_metrics()
+        self._node_elapsed: dict[str, float] = {}
+        self._reused_by_attempt: dict[int, set[str]] = {}
+        self._attempt_node_counts: dict[int, int] = {}
+        self._attempt_layers: dict[int, list[list[str]]] = {}
+        self._attempt_turns: dict[int, dict[str, int]] = {}
+        self._planner_turns_by_attempt: dict[int, int] = {}
+        self._task_started: float | None = None
+        self.task_elapsed_seconds: float | None = None
 
     # -----------------------------------------------------------------
     # 事件与工具
@@ -1231,6 +1339,7 @@ class Scheduler:
                 "只替换或新增失败相关节点，不要重复已完成的工作。"
             )
         prompt_parts.append("\n请只输出符合 schema 的 JSON（不要 Markdown 围栏）：")
+        before = agent_metric_values(agent)
         try:
             agent.inbox.append(
                 "turn",
@@ -1242,6 +1351,16 @@ class Scheduler:
             await agent.turn()
             last_text = _last_assistant_text(agent.session)
         finally:
+            after = agent_metric_values(agent)
+            delta = {
+                key: int(after.get(key, 0)) - int(before.get(key, 0))
+                for key in self._planner_usage
+            }
+            add_metrics(self._planner_usage, delta)
+            self._planner_turns_by_attempt[self.plan_attempt] = (
+                self._planner_turns_by_attempt.get(self.plan_attempt, 0)
+                + int(delta.get("turns", 0) or 0)
+            )
             if owns_agent:
                 agent.destroy()
         return self._parse_plan_json(last_text)
@@ -1431,6 +1550,14 @@ class Scheduler:
 
     def _reconcile_state(self, new_dag: TaskDAG) -> None:
         """新旧 DAG 状态对齐（重规划复用成功节点、保留可恢复记忆）。"""
+        layers = new_dag.layers or new_dag.topo_sort()
+        self._attempt_layers[self.plan_attempt] = [
+            [node.node_id for node in layer] for layer in layers
+        ]
+        if self.plan_attempt > 0:
+            self._attempt_node_counts[self.plan_attempt] = len(
+                new_dag.nodes
+            )
         if self.dag_state is None:
             self.dag_state = GraphState(
                 graph_id=new_dag.graph_id,
@@ -1463,6 +1590,10 @@ class Scheduler:
                     and nid in reusable
                 ):
                     new_states[nid] = old_state.model_copy(deep=True)
+                    if self.plan_attempt > 0:
+                        self._reused_by_attempt.setdefault(
+                            self.plan_attempt, set()
+                        ).add(nid)
                     RuntimeLog.info(
                         "[scheduler] reuse success attempt=%s node=%s "
                         "old_version=%s new_version=%s",
@@ -1474,6 +1605,7 @@ class Scheduler:
                     continue
                 if same and old_state.status in (
                     NodeStatus.FAILED_RECOVERABLE,
+                    NodeStatus.FAILED_FATAL,
                     NodeStatus.PARTIAL,
                 ):
                     new_states[nid] = NodeState(
@@ -1738,6 +1870,9 @@ class Scheduler:
         target.status = NodeStatus.RUNNING
         target.started_at = _utcnow()
         target.input_snapshot = depend_input
+        self._node_execution_counts[node.node_id] = (
+            self._node_execution_counts.get(node.node_id, 0) + 1
+        )
         restored_memory = target.agent_memory_dump or None
         node_session_id = build_node_session_id(
             task_dag.graph_id, node.node_id, self.plan_attempt
@@ -1790,6 +1925,19 @@ class Scheduler:
                         agent_memory_dump=restored_memory or {},
                     )
                 target.update_by_step_res(result)
+                metrics = self._node_usage.setdefault(
+                    node.node_id, zero_metrics()
+                )
+                add_metrics(metrics, result_metric_values(result))
+                attempt_turns = self._attempt_turns.setdefault(
+                    self.plan_attempt, {}
+                )
+                attempt_turns[node.node_id] = attempt_turns.get(
+                    node.node_id, 0
+                ) + int(getattr(result, "turns", 0) or 0)
+                self._node_elapsed[node.node_id] = self._node_elapsed.get(
+                    node.node_id, 0.0
+                ) + float(getattr(result, "elapsed_seconds", 0.0) or 0.0)
                 RuntimeLog.info(
                     "[scheduler] node end attempt=%s layer=%s node=%s "
                     "status=%s rounds=%s failure_type=%s",
@@ -1863,6 +2011,8 @@ class Scheduler:
             max_attempt=self.max_plan_attempt,
         )
         self.plan_exhausted = False
+        self._task_started = time.perf_counter()
+        self.task_elapsed_seconds = None
         while self.plan_attempt < self.max_plan_attempt:
             self.pae_state.advance(
                 PAEPhase.PLAN, attempt=self.plan_attempt
@@ -1928,6 +2078,11 @@ class Scheduler:
                 "status": self.dag_state.global_status.value,
                 "state": self.dag_state.summary(),
             },
+        )
+        self.task_elapsed_seconds = (
+            time.perf_counter() - self._task_started
+            if self._task_started is not None
+            else None
         )
         return self.dag_state
 
